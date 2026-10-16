@@ -51,8 +51,13 @@ pub struct Doc {
 
 impl Doc {
     pub fn new() -> Self {
+        let mut data = DocData::default();
+        // Derived Default would leave bg/palette as zeros (black); the serde
+        // defaults only apply when loading JSON, not for fresh documents.
+        data.bg = default_bg();
+        data.palette = default_palette();
         Self {
-            data: DocData::default(),
+            data,
             next_id: 1,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -467,6 +472,19 @@ mod tests {
         let data = Doc::from_json(&j).unwrap();
         assert_eq!(data.strokes.len(), 1);
         assert_eq!(data.strokes[0].id, 3);
+    }
+    #[test]
+    fn fresh_doc_has_builtin_palette() {
+        // Regression: the derived Default left palette as all-black, so every
+        // swatch and stroke came out black on a fresh canvas.
+        let d = Doc::new();
+        assert_eq!(d.data.bg, default_bg());
+        assert_eq!(d.data.palette, default_palette());
+        assert!(d.data.palette.iter().any(|p| *p != [0, 0, 0]), "palette must not be all black");
+        // serde defaults must agree with fresh-doc defaults
+        let from_json = Doc::from_json(r#"{"strokes":[],"images":[],"texts":[]}"#).unwrap();
+        assert_eq!(from_json.bg, default_bg());
+        assert_eq!(from_json.palette, default_palette());
     }
     #[test]
     fn load_data_dirty_rect_is_bounded() {
