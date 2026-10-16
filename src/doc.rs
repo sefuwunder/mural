@@ -1,6 +1,7 @@
-//! Document: strokes/images/texts + undo/redo + save/load.
+//! Document: strokes/images/texts/clips + undo/redo + save/load.
 //! Pure data (no SDL) except via canvas types.
 
+use crate::audio::AudioClip;
 use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta, VectorMeta};
 use serde::{Deserialize, Serialize};
 
@@ -14,9 +15,12 @@ enum Action {
     DelText { meta: TextMeta, index: usize },
     AddVector { meta: VectorMeta },
     DelVector { meta: VectorMeta, index: usize },
+    AddClip { clip: AudioClip },
+    DelClip { clip: AudioClip, index: usize },
     MoveVector { id: u64, dx: f32, dy: f32 },
     MoveImage { id: u64, dx: f32, dy: f32 },
     MoveText { id: u64, dx: f32, dy: f32 },
+    MoveClip { id: u64, dx: f32, dy: f32 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -26,6 +30,8 @@ pub struct DocData {
     pub texts: Vec<TextMeta>,
     #[serde(default)]
     pub vectors: Vec<VectorMeta>,
+    #[serde(default)]
+    pub clips: Vec<AudioClip>,
     #[serde(default = "default_bg")]
     pub bg: [u8; 3],
     #[serde(default = "default_palette")]
@@ -161,7 +167,27 @@ impl Doc {
             self.push_undo(Action::MoveVector { id, dx, dy });
         }
     }
-
+    // ---- clips ----
+    pub fn add_clip(&mut self, c: AudioClip) {
+        self.data.clips.push(c.clone());
+        self.push_undo(Action::AddClip { clip: c });
+    }
+    pub fn delete_clip(&mut self, id: u64) -> Option<AudioClip> {
+        let i = self.data.clips.iter().position(|c| c.id == id)?;
+        let c = self.data.clips.remove(i);
+        self.push_undo(Action::DelClip { clip: c.clone(), index: i });
+        Some(c)
+    }
+    pub fn move_clip(&mut self, id: u64, dx: f32, dy: f32) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        if let Some(c) = self.data.clips.iter_mut().find(|c| c.id == id) {
+            c.x += dx as f64;
+            c.y += dy as f64;
+            self.push_undo(Action::MoveClip { id, dx, dy });
+        }
+    }
 
     // ---- undo/redo ----
     /// Paint-tile regions are pushed to the dirty list; the app re-syncs
@@ -283,6 +309,32 @@ impl Doc {
                     Action::MoveVector { id, dx, dy },
                 )
             }
+            Action::AddClip { clip } => {
+                let id = clip.id;
+                self.data.clips.retain(|c| c.id != id);
+                (
+                    (),
+                    Action::AddClip { clip },
+                )
+            }
+            Action::DelClip { clip, index } => {
+                let i = index.min(self.data.clips.len());
+                self.data.clips.insert(i, clip.clone());
+                (
+                    (),
+                    Action::DelClip { clip, index: i },
+                )
+            }
+            Action::MoveClip { id, dx, dy } => {
+                if let Some(c) = self.data.clips.iter_mut().find(|c| c.id == id) {
+                    c.x -= dx as f64;
+                    c.y -= dy as f64;
+                }
+                (
+                    (),
+                    Action::MoveClip { id, dx, dy },
+                )
+            }
         }
     }
 
@@ -357,6 +409,22 @@ impl Doc {
                 }
                 ((), Action::MoveVector { id, dx, dy })
             }
+            Action::AddClip { clip } => {
+                self.data.clips.push(clip.clone());
+                ((), Action::AddClip { clip })
+            }
+            Action::DelClip { clip, index } => {
+                let id = clip.id;
+                self.data.clips.retain(|c| c.id != id);
+                ((), Action::DelClip { clip, index })
+            }
+            Action::MoveClip { id, dx, dy } => {
+                if let Some(c) = self.data.clips.iter_mut().find(|c| c.id == id) {
+                    c.x += dx as f64;
+                    c.y += dy as f64;
+                }
+                ((), Action::MoveClip { id, dx, dy })
+            }
         }
     }
 
@@ -377,6 +445,7 @@ impl Doc {
             .chain(self.data.images.iter().map(|m| m.id))
             .chain(self.data.texts.iter().map(|m| m.id))
             .chain(self.data.vectors.iter().map(|m| m.id))
+            .chain(self.data.clips.iter().map(|c| c.id))
             .max()
             .unwrap_or(0)
             + 1;
@@ -409,6 +478,9 @@ impl Doc {
         for v in &self.data.vectors {
             acc(v.rect());
         }
+        for c in &self.data.clips {
+            acc(c.rect());
+        }
         r
     }
 }
@@ -418,7 +490,61 @@ impl Doc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::{b64encode, mulaw_encode};
     use crate::canvas::ToolSer;
+
+    fn clip(id: u64) -> AudioClip {
+        let ulaw: Vec<u8> = (0..1200).map(|i| mulaw_encode(i as i16 - 600)).collect();
+        AudioClip { id, x: 10.0, y: 20.0, seconds: 0.1, data: b64encode(&ulaw) }
+    }
+    #[test]
+    fn clip_undo_redo() {
+        let mut d = Doc::new();
+        d.add_clip(clip(9));
+        assert_eq!(d.data.clips.len(), 1);
+        d.undo();
+        assert!(d.data.clips.is_empty());
+        d.redo();
+        assert_eq!(d.data.clips.len(), 1);
+        assert_eq!(d.data.clips[0].id, 9);
+    }
+    #[test]
+    fn clip_delete_move_undo() {
+        let mut d = Doc::new();
+        d.add_clip(clip(9));
+        d.add_clip(clip(10));
+        d.delete_clip(9);
+        assert_eq!(d.data.clips.len(), 1);
+        assert_eq!(d.data.clips[0].id, 10);
+        d.undo();
+        assert_eq!(d.data.clips.len(), 2);
+        assert_eq!(d.data.clips[0].id, 9);
+        d.move_clip(10, 5.0, -2.0);
+        assert!((d.data.clips[1].x - 15.0).abs() < 1e-9);
+        d.undo();
+        assert!((d.data.clips[1].x - 10.0).abs() < 1e-9);
+    }
+    #[test]
+    fn clip_json_roundtrip() {
+        let mut d = Doc::new();
+        d.add_clip(clip(11));
+        let j = d.to_json().unwrap();
+        assert!(j.contains("\"clips\""), "clips must persist in JSON");
+        let data = Doc::from_json(&j).unwrap();
+        assert_eq!(data.clips.len(), 1);
+        assert_eq!(data.clips[0].id, 11);
+        assert_eq!(data.clips[0].data.len(), clip(11).data.len());
+        // old files without clips still load
+        let legacy = Doc::from_json(r#"{"strokes":[],"images":[],"texts":[]}"#).unwrap();
+        assert!(legacy.clips.is_empty());
+    }
+    #[test]
+    fn clip_in_content_bbox() {
+        let mut d = Doc::new();
+        d.add_clip(clip(12));
+        let b = d.content_bbox().expect("bbox");
+        assert!(b.x0 < 10.0 && b.x1 > 10.0, "clip must widen the bbox");
+    }
 
     fn stroke(id: u64) -> Stroke {
         Stroke { id, tool: ToolSer::Pen, color: 0, size: 4.0, points: vec![(0.0, 0.0), (5.0, 5.0)] }

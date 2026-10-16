@@ -1,17 +1,21 @@
 //! mural — infinite canvas drawing app.
 //! marker / pencil / pen / oil stick, 16 colors, image import, text fields.
 
+mod audio;
 mod brush;
 mod canvas;
 mod doc;
 mod palette;
 mod vector;
 
+use audio::{AudioClip, CLIP_RADIUS};
 use brush::{blit_stamp, walk_segment, TipCache, Tool};
 use canvas::{AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, VectorMeta};
 use doc::Doc;
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
 use palette::{COUNT as PALETTE_COUNT, PALETTE, PAPER_DOT};
+use sdl2::audio::{AudioCallback, AudioDevice, AudioQueue, AudioSpecDesired};
+use sdl2::AudioSubsystem;
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::MouseButton;
@@ -23,6 +27,7 @@ use sdl2::video::{Window, WindowContext};
 use sdl2::Sdl;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const TILE_PX: f32 = 512.0;
@@ -118,6 +123,95 @@ struct TextEdit {
     existing: Option<u64>, // text id being re-edited
 }
 
+/// SDL2 capture callback: appends 12 kHz S16 mono samples to a shared buffer.
+/// try_lock: never block the audio thread; dropping a chunk beats a stall.
+struct CapBuf {
+    buf: Arc<Mutex<Vec<i16>>>,
+    freq: i32,
+}
+impl AudioCallback for CapBuf {
+    type Channel = i16;
+    fn callback(&mut self, input: &mut [i16]) {
+        if let Ok(mut b) = self.buf.try_lock() {
+            b.extend_from_slice(input);
+            let max = (self.freq as usize) * audio::CLIP_MAX_SECS;
+            if b.len() > max {
+                let drop = b.len() - max;
+                b.drain(..drop);
+            }
+        }
+    }
+}
+
+/// An in-progress recording. The device is held for its Drop effect:
+/// dropping it stops the capture.
+struct RecState {
+    _dev: AudioDevice<CapBuf>,
+    buf: Arc<Mutex<Vec<i16>>>,
+    start: Instant,
+    freq: i32,
+}
+
+/// An in-progress playback. The queue is held alive for its Drop effect.
+struct PlayState {
+    _q: AudioQueue<i16>,
+    clip_id: u64,
+    start: Instant,
+    seconds: f32,
+}
+
+/// `m:ss` for a float second count.
+fn fmt_dur(secs: f32) -> String {
+    let s = secs.max(0.0) as u32;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// Filled circle on any window canvas (markers, rec dot).
+fn fill_circle(c: &mut Canvas<Window>, cx: i32, cy: i32, r: i32) -> Result<(), String> {
+    let r = r.max(1);
+    for dy in -r..=r {
+        let dx = ((r * r - dy * dy) as f32).sqrt() as i32;
+        c.draw_line((cx - dx, cy + dy), (cx + dx, cy + dy)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Circle outline on any window canvas.
+fn draw_circle(c: &mut Canvas<Window>, cx: i32, cy: i32, r: i32) -> Result<(), String> {
+    let r = r.max(1);
+    let mut prev: Option<(i32, i32)> = None;
+    for i in 0..=48 {
+        let a = i as f32 / 48.0 * std::f32::consts::TAU;
+        let p = (cx + (r as f32 * a.cos()) as i32, cy + (r as f32 * a.sin()) as i32);
+        if let Some(q) = prev {
+            c.draw_line(q, p).map_err(|e| e.to_string())?;
+        }
+        prev = Some(p);
+    }
+    Ok(())
+}
+
+/// Procedural mic glyph inside a marker of radius r, in the current draw color.
+fn draw_mic_glyph(c: &mut Canvas<Window>, cx: i32, cy: i32, r: i32) -> Result<(), String> {
+    let rf = r as f32;
+    // mic head: capsule
+    let hw = (rf * 0.13) as i32;
+    let hy0 = cy - (rf * 0.30) as i32;
+    let hy1 = cy + (rf * 0.06) as i32;
+    c.fill_rect(SdlRect::new(cx - hw, hy0, (hw * 2) as u32, (hy1 - hy0).max(1) as u32))
+        .map_err(|e| e.to_string())?;
+    fill_circle(c, cx, hy0, hw)?;
+    fill_circle(c, cx, hy1, hw)?;
+    // stem + base
+    c.draw_line((cx, hy1 + hw), (cx, cy + (rf * 0.26) as i32)).map_err(|e| e.to_string())?;
+    c.draw_line(
+        (cx - (rf * 0.18) as i32, cy + (rf * 0.26) as i32),
+        (cx + (rf * 0.18) as i32, cy + (rf * 0.26) as i32),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorTarget {
     Swatch(usize),
@@ -201,6 +295,12 @@ struct App<'tc, 'ttf> {
     label_fade: f32,
     text_panel_hits: Vec<(SdlRect, TextPanelAction)>,
     tbox: Option<(f32, f32, f32, f32)>,
+    // voice clips
+    audio_ss: Option<AudioSubsystem>,
+    rec: Option<RecState>,
+    playing: Option<PlayState>,
+    mouse_sx: i32,
+    mouse_sy: i32,
 }
 
 fn tiles_in_rect(r: &Rect) -> Vec<(i32, i32)> {
@@ -295,6 +395,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             label_fade: 1.0,
             text_panel_hits: vec![],
             tbox: None,
+            audio_ss: None,
+            rec: None,
+            playing: None,
+            mouse_sx: win_w as i32 / 2,
+            mouse_sy: win_h as i32 / 2,
             start: Instant::now(),
             last_click_at: None,
             last_click_item: None,
@@ -501,6 +606,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
 
     /// Hit test topmost-first (text > paint > images, matching draw order top-down).
     fn hit_test(&self, wx: f32, wy: f32) -> Option<(SelKind, u64)> {
+        for c in self.doc.data.clips.iter().rev() {
+            let (dx, dy) = self.move_delta_for(SelKind::Clip, c.id);
+            let ddx = wx - (c.x as f32 + dx);
+            let ddy = wy - (c.y as f32 + dy);
+            if (ddx * ddx + ddy * ddy).sqrt() < CLIP_RADIUS as f32 {
+                return Some((SelKind::Clip, c.id));
+            }
+        }
         for t in self.doc.data.texts.iter().rev() {
             let (dx, dy) = self.move_delta_for(SelKind::Text, t.id);
             if Rect::new(t.x + dx, t.y + dy, t.x + dx + t.w, t.y + dy + t.h).contains(wx, wy) {
@@ -625,6 +738,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                             return;
                         }
                     }
+                    if dbl && kind == SelKind::Clip {
+                        self.selection = Some((kind, id));
+                        self.toggle_play(id);
+                        return;
+                    }
                     self.selection = Some((kind, id));
                     if kind != SelKind::Stroke {
                         self.drag = DragKind::MoveItem;
@@ -671,6 +789,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             SelKind::Image => self.doc.data.images.iter().find(|m| m.id == id).map(|m| (m.x, m.y)).unwrap_or((0.0, 0.0)),
             SelKind::Text => self.doc.data.texts.iter().find(|t| t.id == id).map(|t| (t.x, t.y)).unwrap_or((0.0, 0.0)),
             SelKind::Vector => self.doc.data.vectors.iter().find(|v| v.id == id).map(|v| (v.x, v.y)).unwrap_or((0.0, 0.0)),
+            SelKind::Clip => self.doc.data.clips.iter().find(|c| c.id == id).map(|c| (c.x as f32, c.y as f32)).unwrap_or((0.0, 0.0)),
             SelKind::Stroke => (0.0, 0.0),
         }
     }
@@ -812,6 +931,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                         SelKind::Image => self.doc.move_image(self.move_id, dx, dy),
                         SelKind::Text => self.doc.move_text(self.move_id, dx, dy),
                         SelKind::Vector => self.doc.move_vector(self.move_id, dx, dy),
+                        SelKind::Clip => self.doc.move_clip(self.move_id, dx, dy),
                         SelKind::Stroke => {}
                     }
                 }
@@ -854,7 +974,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
 
         match keycode {
             Some(Keycode::Escape) => {
-                if self.color_edit.is_some() {
+                if self.rec.is_some() {
+                    self.cancel_record();
+                } else if self.color_edit.is_some() {
                     self.color_edit = None;
                 } else if self.show_help {
                     self.show_help = false;
@@ -881,6 +1003,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 video.text_input().start();
             }
             Some(Keycode::X) if !ctrl => self.vectorize_selection(),
+            Some(Keycode::A) if !ctrl => self.toggle_record(),
             Some(Keycode::LeftBracket) => self.set_brush_size(self.brush_size() / 1.25),
             Some(Keycode::RightBracket) => self.set_brush_size(self.brush_size() * 1.25),
             Some(Keycode::Z) if ctrl && !shift => self.do_undo(),
@@ -998,6 +1121,12 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     self.vec_data.remove(&id);
                     self.vec_tex.remove(&id);
                 }
+                SelKind::Clip => {
+                    self.doc.delete_clip(id);
+                    if self.playing.as_ref().map(|p| p.clip_id == id).unwrap_or(false) {
+                        self.playing = None;
+                    }
+                }
             }
         }
     }
@@ -1073,6 +1202,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         // advance vector animations
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = Instant::now();
+        self.poll_audio();
         // fade the chrome while typing or drawing so it never blocks the canvas
         let target = if self.text_edit.is_some() || self.active_stroke.is_some() { 0.22 } else { 1.0 };
         let k = (dt * 9.0).min(1.0);
@@ -1089,12 +1219,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.draw_images()?;
         self.draw_vectors()?;
         self.draw_texts()?;
+        self.draw_clips()?;
         self.draw_active_stroke()?;
         self.draw_selection();
         self.draw_tbox_rubber()?;
         self.draw_text_edit()?;
         self.canvas.set_blend_mode(BlendMode::Blend);
         self.draw_chrome()?;
+        self.draw_rec_indicator()?;
         self.draw_vector_panel()?;
         self.draw_text_panel()?;
         self.canvas.set_blend_mode(BlendMode::None);
@@ -1105,6 +1237,245 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.draw_import_bar()?;
         self.draw_toast()?;
         self.canvas.present();
+        Ok(())
+    }
+
+    // ================= voice clips =================
+    // 12 kHz S16 mono capture, μ-law companded to 8-bit = 96 kbps exactly.
+
+    fn clip_spec() -> AudioSpecDesired {
+        AudioSpecDesired { freq: Some(audio::SAMPLE_RATE), channels: Some(1), samples: Some(1024) }
+    }
+
+    fn toggle_record(&mut self) {
+        if self.rec.is_some() {
+            self.stop_record();
+        } else {
+            self.start_record();
+        }
+    }
+
+    fn start_record(&mut self) {
+        if self.audio_ss.is_none() {
+            self.toast("no audio subsystem");
+            return;
+        }
+        let ss = self.audio_ss.clone().unwrap();
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let buf2 = buf.clone();
+        match ss.open_capture(None::<&str>, &Self::clip_spec(), |ospec| CapBuf {
+            buf: buf2,
+            freq: ospec.freq,
+        }) {
+            Ok(dev) => {
+                let freq = dev.spec().freq;
+                dev.resume();
+                self.rec = Some(RecState { _dev: dev, buf, start: Instant::now(), freq });
+                // stop any playback while recording
+                self.playing = None;
+            }
+            Err(e) => self.toast(&format!("no mic ({})", e)),
+        }
+    }
+
+    fn stop_record(&mut self) {
+        let rec = match self.rec.take() {
+            Some(r) => r,
+            None => return,
+        };
+        // dev drops here -> capture stops
+        let samples: Vec<i16> = rec.buf.lock().map(|b| b.clone()).unwrap_or_default();
+        let seconds = samples.len() as f32 / rec.freq.max(1) as f32;
+        if samples.is_empty() || seconds < 0.3 {
+            self.toast("clip too short");
+            return;
+        }
+        let ulaw: Vec<u8> = samples.iter().map(|&s| audio::mulaw_encode(s)).collect();
+        let id = self.doc.alloc_id();
+        // drop at the mouse; screen center if the pointer is over UI chrome
+        let (w, h) = (self.win_w as f32, self.win_h as f32);
+        let (wx, wy) = if self.ui_hit(self.mouse_sx, self.mouse_sy) {
+            self.cam.screen_to_world(w / 2.0, h / 2.0, w, h)
+        } else {
+            self.cam.screen_to_world(self.mouse_sx as f32, self.mouse_sy as f32, w, h)
+        };
+        let clip = AudioClip {
+            id,
+            x: wx as f64,
+            y: wy as f64,
+            seconds,
+            data: audio::b64encode(&ulaw),
+        };
+        self.doc.add_clip(clip);
+        self.selection = Some((SelKind::Clip, id));
+        let s = seconds as u32;
+        self.toast(&format!("clip {}:{:02}", s / 60, s % 60));
+    }
+
+    fn cancel_record(&mut self) {
+        if self.rec.take().is_some() {
+            self.toast("recording cancelled");
+        }
+    }
+
+    /// Double-click toggles; Space plays (never stops, so key-repeat is safe).
+    fn toggle_play(&mut self, id: u64) {
+        if self.playing.as_ref().map(|p| p.clip_id == id).unwrap_or(false) {
+            self.playing = None;
+            return;
+        }
+        self.play_clip(id);
+    }
+
+    fn play_clip_if_idle(&mut self, id: u64) {
+        if self.playing.as_ref().map(|p| p.clip_id == id).unwrap_or(false) {
+            return;
+        }
+        self.play_clip(id);
+    }
+
+    fn play_clip(&mut self, id: u64) {
+        let clip = match self.doc.data.clips.iter().find(|c| c.id == id) {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let pcm = match clip.pcm() {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                self.toast("clip data corrupt");
+                return;
+            }
+        };
+        let ss = match &self.audio_ss {
+            Some(ss) => ss.clone(),
+            None => {
+                self.toast("no audio subsystem");
+                return;
+            }
+        };
+        match ss.open_queue::<i16, _>(None::<&str>, &Self::clip_spec()) {
+            Ok(q) => {
+                if q.queue_audio(&pcm).is_err() {
+                    self.toast("playback failed");
+                    return;
+                }
+                q.resume();
+                self.playing = Some(PlayState { _q: q, clip_id: id, start: Instant::now(), seconds: clip.seconds.max(0.1) });
+            }
+            Err(e) => self.toast(&format!("no audio out ({})", e)),
+        }
+    }
+
+    fn poll_audio(&mut self) {
+        // finish playback
+        if let Some(p) = &self.playing {
+            if p.start.elapsed().as_secs_f32() >= p.seconds {
+                self.playing = None;
+            }
+        }
+        // auto-stop at the length cap
+        if let Some(r) = &self.rec {
+            if r.start.elapsed().as_secs() >= audio::CLIP_MAX_SECS as u64 {
+                self.stop_record();
+                self.toast("clip max length");
+            }
+        }
+    }
+
+    fn draw_clips(&mut self) -> Result<(), String> {
+        let cam = self.cam;
+        let (w, h) = (self.win_w as f32, self.win_h as f32);
+        let view = self.cam.view_rect(w, h);
+        let items: Vec<AudioClip> = self
+            .doc
+            .data
+            .clips
+            .iter()
+            .map(|c| {
+                let (dx, dy) = self.move_delta_for(SelKind::Clip, c.id);
+                let mut cc = c.clone();
+                cc.x += dx as f64;
+                cc.y += dy as f64;
+                cc
+            })
+            .collect();
+        for c in items {
+            let r = Rect::new(
+                c.x as f32 - CLIP_RADIUS as f32,
+                c.y as f32 - CLIP_RADIUS as f32,
+                c.x as f32 + CLIP_RADIUS as f32,
+                c.y as f32 + CLIP_RADIUS as f32,
+            );
+            if !view.intersects(&r) {
+                continue;
+            }
+            let (sx, sy) = cam.world_to_screen(c.x as f32, c.y as f32, w, h);
+            let sr = (CLIP_RADIUS as f32 * cam.zoom).max(8.0) as i32;
+            let (cx, cy) = (sx as i32, sy as i32);
+            let selected = self.selection == Some((SelKind::Clip, c.id));
+            let playing = self.playing.as_ref().map(|p| p.clip_id == c.id).unwrap_or(false);
+            // badge
+            let bg = self.bg_color();
+            self.canvas.set_draw_color(Color::RGBA(bg.r, bg.g, bg.b, 220));
+            fill_circle(&mut self.canvas, cx, cy, sr)?;
+            self.canvas.set_draw_color(if selected { ACCENT } else { INK });
+            draw_circle(&mut self.canvas, cx, cy, sr)?;
+            draw_mic_glyph(&mut self.canvas, cx, cy, sr)?;
+            // playing: progress ring + elapsed readout in the label
+            if playing {
+                if let Some(p) = &self.playing {
+                    let frac = (p.start.elapsed().as_secs_f32() / p.seconds).min(1.0);
+                    self.canvas.set_draw_color(ACCENT);
+                    let mut prev: Option<(i32, i32)> = None;
+                    let steps = (frac * 48.0) as i32;
+                    for i in 0..=steps.max(1) {
+                        let a = -std::f32::consts::FRAC_PI_2 + i as f32 / 48.0 * std::f32::consts::TAU;
+                        let rr = sr + 4;
+                        let pt = (
+                            cx + (rr as f32 * a.cos()) as i32,
+                            cy + (rr as f32 * a.sin()) as i32,
+                        );
+                        if let Some(q) = prev {
+                            self.canvas.draw_line(q, pt)?;
+                        }
+                        prev = Some(pt);
+                    }
+                }
+            }
+            let label = if playing {
+                if let Some(p) = &self.playing {
+                    let e = p.start.elapsed().as_secs_f32().min(p.seconds);
+                    format!("▶ {} / {}", fmt_dur(e), c.duration_label())
+                } else {
+                    c.duration_label()
+                }
+            } else {
+                c.duration_label()
+            };
+            let save = self.label_fade;
+            self.label_fade = 1.0;
+            self.draw_label(&label, if selected { ACCENT } else { INK }, cx - sr, cy + sr + 4)?;
+            self.label_fade = save;
+        }
+        Ok(())
+    }
+
+    /// Pulsing red dot + live timer in the top bar while recording.
+    /// Drawn at full opacity even when the chrome is faded.
+    fn draw_rec_indicator(&mut self) -> Result<(), String> {
+        let rec = match &self.rec {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let save = self.label_fade;
+        self.label_fade = 1.0;
+        let pulse = (self.start.elapsed().as_secs_f32() * 5.0).sin() > 0.0;
+        let dot_col = if pulse { Color::RGB(0xe0, 0x20, 0x20) } else { Color::RGB(0x80, 0x20, 0x20) };
+        self.canvas.set_draw_color(dot_col);
+        fill_circle(&mut self.canvas, 100, 22, 8)?;
+        let s = rec.start.elapsed().as_secs() as u32;
+        self.draw_label(&format!("REC {}:{:02}", s / 60, s % 60), dot_col, 115, 12)?;
+        self.label_fade = save;
         Ok(())
     }
 
@@ -1490,6 +1861,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             SelKind::Vector => self.doc.data.vectors.iter().find(|v| v.id == id).map(|v| {
                 let (dx, dy) = self.move_delta_for(kind, id);
                 Rect::new(v.x + dx, v.y + dy, v.x + dx + v.sw, v.y + dy + v.sh)
+            }),
+            SelKind::Clip => self.doc.data.clips.iter().find(|c| c.id == id).map(|c| {
+                let (dx, dy) = self.move_delta_for(kind, id);
+                let (x, y, r) = (c.x as f32, c.y as f32, CLIP_RADIUS as f32);
+                Rect::new(x + dx - r, y + dy - r, x + dx + r, y + dy + r)
             }),
         };
         if let Some(r) = r {
@@ -2047,6 +2423,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "drag box corners to resize; double-click to re-edit",
             "[ ] brush size   wheel zoom",
             "I import folder   drag & drop works too",
+            "A record voice clip (12kHz μ-law 96kbps); A again = stop, esc = cancel",
+            "V + click a clip to select; double-click or space = play; del removes",
             "right-click a color swatch to edit it; BG edits canvas",
             "del remove selected   esc deselect",
             "ctrl+Z / ctrl+Y undo / redo",
@@ -2433,6 +2811,21 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                             );
                         }
                     }
+                    // voice-clip markers (circle + mic glyph; export is 1:1, no zoom)
+                    for cl in &doc.data.clips {
+                        let cx = (cl.x - ox as f64) as i32;
+                        let cy = (cl.y - oy as f64) as i32;
+                        let r = CLIP_RADIUS as i32;
+                        if cx + r < 0 || cy + r < 0 || cx - r > w as i32 || cy - r > h as i32 {
+                            continue;
+                        }
+                        let b = doc.data.bg;
+                        c.set_draw_color(Color::RGBA(b[0], b[1], b[2], 220));
+                        let _ = fill_circle(&mut *c, cx, cy, r);
+                        c.set_draw_color(Color::RGB(0x1c, 0x1a, 0x17));
+                        let _ = draw_circle(&mut *c, cx, cy, r);
+                        let _ = draw_mic_glyph(&mut *c, cx, cy, r);
+                    }
                     pixels = c
                         .read_pixels(SdlRect::new(0, 0, w, h), PixelFormatEnum::RGB24)
                         .unwrap_or_default();
@@ -2452,6 +2845,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     // ================= run =================
     fn run(&mut self, sdl: &Sdl, video: &sdl2::VideoSubsystem) -> Result<(), String> {
         let mut pump = sdl.event_pump().map_err(|e| e.to_string())?;
+        // Audio is optional: recording/playback degrade to a toast when missing.
+        self.audio_ss = sdl.audio().ok();
         'main: loop {
             for ev in pump.poll_iter() {
                 match ev {
@@ -2461,12 +2856,22 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                         self.win_h = wh as u32;
                     }
                     Event::MouseButtonDown { x, y, mouse_btn, .. } => self.on_down(x, y, mouse_btn, video),
-                    Event::MouseMotion { x, y, .. } => self.on_motion(x, y),
+                    Event::MouseMotion { x, y, .. } => {
+                        self.mouse_sx = x;
+                        self.mouse_sy = y;
+                        self.on_motion(x, y);
+                    }
                     Event::MouseButtonUp { mouse_btn, .. } => self.on_up(mouse_btn, video),
                     Event::MouseWheel { y, mouse_x, mouse_y, .. } => self.on_wheel(y, mouse_x, mouse_y),
-                    Event::KeyDown { keycode, keymod, .. } => {
+                    Event::KeyDown { keycode, keymod, repeat, .. } => {
                         if keycode == Some(Keycode::Space) {
                             self.space_down = true;
+                            // Space plays the selected clip (repeat-safe: never stops)
+                            if !repeat {
+                                if let Some((SelKind::Clip, id)) = self.selection {
+                                    self.play_clip_if_idle(id);
+                                }
+                            }
                         } else if !self.on_key(keycode, keymod, video) {
                             break 'main;
                         }
@@ -2592,6 +2997,25 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         assert_eq!(self.doc.data.vectors.len(), nv0 - 1);
         self.doc.redo();
         assert_eq!(self.doc.data.vectors.len(), nv0);
+        // voice clip: doc-level add/undo/redo (no mic needed; codec is unit-tested).
+        // 1 s of synthetic μ-law at 12 kHz.
+        let ulaw: Vec<u8> = (0..12000).map(|i| audio::mulaw_encode(((i % 200) as i16 - 100) * 40)).collect();
+        let clip_id = self.doc.alloc_id();
+        self.doc.add_clip(AudioClip {
+            id: clip_id,
+            x: 100.0,
+            y: -50.0,
+            seconds: 1.0,
+            data: audio::b64encode(&ulaw),
+        });
+        let nc0 = self.doc.data.clips.len();
+        self.doc.undo();
+        assert_eq!(self.doc.data.clips.len(), nc0 - 1, "clip undo");
+        self.doc.redo();
+        assert_eq!(self.doc.data.clips.len(), nc0, "clip redo");
+        let c = self.doc.data.clips.iter().find(|c| c.id == clip_id).unwrap();
+        assert_eq!(c.pcm().unwrap().len(), 12000, "clip pcm decodes");
+        assert_eq!(c.duration_label(), "0:01");
         // save/load roundtrip with the vector present (exercises load_data +
         // sync_media; the following rerasterize() would previously try to
         // allocate ~122TB of tile keys and crash)
@@ -2608,6 +3032,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         assert_eq!(self.doc.data.vectors.len(), nv, "vectors survive roundtrip");
         assert_eq!(self.doc.data.images.len(), ni, "images survive roundtrip");
         assert_eq!(self.doc.data.strokes.len(), ns, "strokes survive roundtrip");
+        assert_eq!(self.doc.data.clips.len(), nc0, "clips survive roundtrip");
+        assert_eq!(self.doc.data.clips[0].pcm().unwrap().len(), 12000, "clip audio survives roundtrip");
         // vector panel clicks must reach ui_click, not the canvas hit-test.
         // Regression: the panel floats above the bottom bar (canvas territory),
         // so clicks fell through, hit empty canvas and deselected the vector.

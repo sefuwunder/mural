@@ -213,6 +213,7 @@ pub enum SelKind {
     Image,
     Text,
     Vector,
+    Clip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
