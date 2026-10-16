@@ -126,7 +126,7 @@ enum DragKind {
     Speed,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PanelAction {
     Anim(AnimKind),
     PlayPause,
@@ -362,7 +362,29 @@ fn rasterize_stroke<'a>(
 // ================= events =================
 impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn ui_hit(&self, sx: i32, sy: i32) -> bool {
-        sy < TOP_H || sx < TOOL_W || sy > self.win_h as i32 - BOT_H
+        if sy < TOP_H || sx < TOOL_W || sy > self.win_h as i32 - BOT_H {
+            return true;
+        }
+        // the vector panel floats above the bottom bar, in canvas territory —
+        // its clicks must reach ui_click, not the canvas hit-test
+        if let Some(r) = self.vector_panel_rect() {
+            if r.contains_point((sx, sy)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Screen rect of the vector animation panel, when a vector is selected.
+    fn vector_panel_rect(&self) -> Option<SdlRect> {
+        match self.selection {
+            Some((SelKind::Vector, _)) => {
+                let (w, h) = (self.win_w as i32, self.win_h as i32);
+                let pw = 700i32;
+                Some(SdlRect::new((w - pw) / 2, h - BOT_H - 50, pw as u32, 42))
+            }
+            _ => None,
+        }
     }
 
     fn tool_rect(&self, i: usize) -> SdlRect {
@@ -1024,10 +1046,12 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             },
             _ => return Ok(()),
         };
-        let (w, h) = (self.win_w as i32, self.win_h as i32);
-        let pw = 700i32;
-        let px = (w - pw) / 2;
-        let py = h - BOT_H - 50;
+        let pr = match self.vector_panel_rect() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let (px, py) = (pr.x(), pr.y());
+        let pw = pr.width() as i32;
         self.canvas.set_draw_color(CHROME2);
         self.canvas.fill_rect(SdlRect::new(px, py, pw as u32, 42))?;
         self.canvas.set_draw_color(ACCENT);
@@ -1841,6 +1865,27 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         assert_eq!(self.doc.data.vectors.len(), nv, "vectors survive roundtrip");
         assert_eq!(self.doc.data.images.len(), ni, "images survive roundtrip");
         assert_eq!(self.doc.data.strokes.len(), ns, "strokes survive roundtrip");
+        // vector panel clicks must reach ui_click, not the canvas hit-test.
+        // Regression: the panel floats above the bottom bar (canvas territory),
+        // so clicks fell through, hit empty canvas and deselected the vector.
+        let vid = self.doc.data.vectors[0].id;
+        self.selection = Some((SelKind::Vector, vid));
+        self.frame()?;
+        let pr = self.vector_panel_rect().expect("panel rect");
+        assert!(self.ui_hit(pr.x() + 10, pr.y() + 10), "panel must count as UI chrome");
+        let wave = self
+            .panel_hits
+            .iter()
+            .find(|(_, a)| *a == PanelAction::Anim(AnimKind::Wave))
+            .map(|(r, _)| *r)
+            .expect("wave button");
+        self.ui_click(wave.x() + wave.width() as i32 / 2, wave.y() + wave.height() as i32 / 2);
+        assert_eq!(
+            self.doc.data.vectors.iter().find(|v| v.id == vid).unwrap().anim,
+            AnimKind::Wave,
+            "wave click must set the anim mode"
+        );
+        assert_eq!(self.selection, Some((SelKind::Vector, vid)), "panel click must not deselect");
         // still frame for the export visual
         if let Some(m) = self.doc.data.vectors.iter_mut().find(|v| v.id == vid) {
             m.anim = AnimKind::Still;
