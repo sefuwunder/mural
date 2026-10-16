@@ -30,6 +30,18 @@ pub const PALETTE: [Swatch; COUNT] = [
 ];
 
 pub const PAPER: Color = Color::RGB(0xd8, 0xd3, 0xc5);
+
+/// Built-in palette as plain RGB triples (for serde defaults / doc storage).
+pub fn default_rgb() -> [[u8; 3]; COUNT] {
+    let mut out = [[0u8; 3]; COUNT];
+    let mut i = 0;
+    while i < COUNT {
+        let c = PALETTE[i].color;
+        out[i] = [c.r, c.g, c.b];
+        i += 1;
+    }
+    out
+}
 pub const PAPER_DOT: Color = Color::RGB(0xc4, 0xbd, 0xac);
 
 #[cfg(test)]

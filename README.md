@@ -44,8 +44,19 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 
 ## Text
 
-- `T` → click anywhere → type → Enter commits
-- Double-click a label with `V` to re-edit it
+- `T` → click anywhere → type → Enter commits (point text)
+- `T` → **drag** a box → type → text flows inside it (word wrap)
+- Select a text box for the text panel: shape (none / rect / oval),
+  alignment (left / center / right), font size
+- Drag the box corners to resize; double-click a label with `V` to re-edit it
+- Clicking a color swatch recolors the selected text
+
+## Canvas & palette
+
+- The **BG** swatch (top bar) shows the canvas color — click it, or
+  right-click any color swatch, to open the color editor (RGB sliders)
+- Custom colors and the background travel with the saved file
+- The toolbar fades while you type or draw so it never blocks the canvas
 
 ## Shortcuts
 

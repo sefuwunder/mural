@@ -26,6 +26,19 @@ pub struct DocData {
     pub texts: Vec<TextMeta>,
     #[serde(default)]
     pub vectors: Vec<VectorMeta>,
+    #[serde(default = "default_bg")]
+    pub bg: [u8; 3],
+    #[serde(default = "default_palette")]
+    pub palette: [[u8; 3]; 16],
+}
+
+pub fn default_bg() -> [u8; 3] {
+    let c = crate::palette::PAPER;
+    [c.r, c.g, c.b]
+}
+
+pub fn default_palette() -> [[u8; 3]; 16] {
+    crate::palette::default_rgb()
 }
 
 pub struct Doc {
@@ -144,13 +157,6 @@ impl Doc {
         }
     }
 
-    pub fn set_text(&mut self, id: u64, text: String, w: f32, h: f32) {
-        if let Some(m) = self.data.texts.iter_mut().find(|m| m.id == id) {
-            m.text = text;
-            m.w = w;
-            m.h = h;
-        }
-    }
 
     // ---- undo/redo ----
     /// Paint-tile regions are pushed to the dirty list; the app re-syncs

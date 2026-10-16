@@ -191,6 +191,14 @@ pub struct TextMeta {
     pub color: usize,
     pub w: f32, // measured, world px
     pub h: f32,
+    #[serde(default)]
+    pub box_w: f32, // >0: bounded text box (world px); 0 = point text
+    #[serde(default)]
+    pub box_h: f32,
+    #[serde(default)]
+    pub align: u8, // 0 left, 1 center, 2 right
+    #[serde(default)]
+    pub shape: u8, // 0 none, 1 rect, 2 ellipse
 }
 
 impl TextMeta {

@@ -11,7 +11,7 @@ use brush::{blit_stamp, walk_segment, TipCache, Tool};
 use canvas::{AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, VectorMeta};
 use doc::Doc;
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
-use palette::{COUNT as PALETTE_COUNT, PALETTE, PAPER, PAPER_DOT};
+use palette::{COUNT as PALETTE_COUNT, PALETTE, PAPER_DOT};
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::MouseButton;
@@ -112,8 +112,16 @@ struct ActiveStroke {
 struct TextEdit {
     x: f32,
     y: f32, // world
+    bw: f32, // box w/h, 0 = point text
+    bh: f32,
     buf: String,
     existing: Option<u64>, // text id being re-edited
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorTarget {
+    Swatch(usize),
+    Bg,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -124,6 +132,16 @@ enum DragKind {
     Stroke,
     Slider,
     Speed,
+    PalSlider(u8),
+    TextBox,
+    ResizeText(u64, u8),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TextPanelAction {
+    Shape(u8),
+    Align(u8),
+    Size(f32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -178,6 +196,11 @@ struct App<'tc, 'ttf> {
     win_w: u32,
     win_h: u32,
     current_path: Option<std::path::PathBuf>,
+    color_edit: Option<ColorTarget>,
+    ui_fade: f32,
+    label_fade: f32,
+    text_panel_hits: Vec<(SdlRect, TextPanelAction)>,
+    tbox: Option<(f32, f32, f32, f32)>,
 }
 
 fn tiles_in_rect(r: &Rect) -> Vec<(i32, i32)> {
@@ -267,6 +290,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             show_help: false,
             toast: None,
             current_path: None,
+            color_edit: None,
+            ui_fade: 1.0,
+            label_fade: 1.0,
+            text_panel_hits: vec![],
+            tbox: None,
             start: Instant::now(),
             last_click_at: None,
             last_click_item: None,
@@ -322,7 +350,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                         if !s.bbox().intersects(&trect) {
                             continue;
                         }
-                        rasterize_stroke(c, tc, tips, s, origin);
+                        rasterize_stroke(c, tc, tips, s, origin, &doc.data.palette);
                     }
                 })
                 .expect("rasterize");
@@ -336,6 +364,7 @@ fn rasterize_stroke<'a>(
     tips: &mut TipCache<'a>,
     s: &Stroke,
     origin: (f32, f32),
+    pal: &[[u8; 3]; 16],
 ) {
     if s.points.is_empty() {
         return;
@@ -343,7 +372,8 @@ fn rasterize_stroke<'a>(
     let tool = Tool::from(s.tool);
     let d = s.size.max(2.0) as u32;
     let tip = tips.get(tc, tool, d).expect("tip");
-    let col = PALETTE[s.color % PALETTE_COUNT].color;
+    let p = pal[s.color % 16];
+    let col = Color::RGB(p[0], p[1], p[2]);
     tip.set_color_mod(col.r, col.g, col.b);
     let stamp = |c: &mut Canvas<Window>, x: f32, y: f32, dd: f32| {
         blit_stamp(c, tip, x - origin.0, y - origin.1, dd).expect("stamp");
@@ -364,6 +394,50 @@ fn rasterize_stroke<'a>(
 
 // ================= events =================
 impl<'tc, 'ttf> App<'tc, 'ttf> {
+    fn pal(&self, i: usize) -> Color {
+        let p = self.doc.data.palette[i % PALETTE_COUNT];
+        Color::RGB(p[0], p[1], p[2])
+    }
+    fn bg_color(&self) -> Color {
+        let b = self.doc.data.bg;
+        Color::RGB(b[0], b[1], b[2])
+    }
+    fn fade_col(&self, c: Color) -> Color {
+        Color::RGBA(c.r, c.g, c.b, (c.a as f32 * self.ui_fade) as u8)
+    }
+    fn cc(&mut self, c: Color) {
+        let fc = self.fade_col(c);
+        self.canvas.set_draw_color(fc);
+    }
+    fn edit_rgb(&self) -> [u8; 3] {
+        match self.color_edit {
+            Some(ColorTarget::Swatch(i)) => self.doc.data.palette[i % PALETTE_COUNT],
+            Some(ColorTarget::Bg) => self.doc.data.bg,
+            None => [0, 0, 0],
+        }
+    }
+    fn set_edit_channel(&mut self, ch: u8, v: u8) {
+        match self.color_edit {
+            Some(ColorTarget::Swatch(i)) => {
+                self.doc.data.palette[i % PALETTE_COUNT][ch as usize] = v;
+            }
+            Some(ColorTarget::Bg) => {
+                self.doc.data.bg[ch as usize] = v;
+            }
+            None => {}
+        }
+    }
+    fn bg_rect(&self) -> SdlRect {
+        SdlRect::new(self.win_w as i32 - 368, 8, 60, 28)
+    }
+    fn color_popup_rect(&self) -> SdlRect {
+        let (w, h) = (self.win_w as i32, self.win_h as i32);
+        SdlRect::new((w - 320) / 2, (h - 230) / 2, 320, 230)
+    }
+    fn pal_slider_rect(&self, ch: u8) -> SdlRect {
+        let pr = self.color_popup_rect();
+        SdlRect::new(pr.x() + 70, pr.y() + 78 + ch as i32 * 40, (pr.width() as i32 - 90).max(10) as u32, 16)
+    }
     fn ui_hit(&self, sx: i32, sy: i32) -> bool {
         if sy < TOP_H || sx < TOOL_W || sy > self.win_h as i32 - BOT_H {
             return true;
@@ -375,6 +449,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 return true;
             }
         }
+        if let Some(r) = self.text_panel_rect() {
+            if r.contains_point((sx, sy)) {
+                return true;
+            }
+        }
+        if self.color_edit.is_some() && self.color_popup_rect().contains_point((sx, sy)) {
+            return true;
+        }
         false
     }
 
@@ -384,6 +466,18 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             Some((SelKind::Vector, _)) => {
                 let (w, h) = (self.win_w as i32, self.win_h as i32);
                 let pw = 700i32;
+                Some(SdlRect::new((w - pw) / 2, h - BOT_H - 50, pw as u32, 42))
+            }
+            _ => None,
+        }
+    }
+
+    /// Screen rect of the text panel, when a text is selected.
+    fn text_panel_rect(&self) -> Option<SdlRect> {
+        match self.selection {
+            Some((SelKind::Text, _)) => {
+                let (w, h) = (self.win_w as i32, self.win_h as i32);
+                let pw = 560i32;
                 Some(SdlRect::new((w - pw) / 2, h - BOT_H - 50, pw as u32, 42))
             }
             _ => None,
@@ -458,6 +552,19 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn on_down(&mut self, sx: i32, sy: i32, btn: MouseButton, video: &sdl2::VideoSubsystem) {
+        // right-click on a swatch / bg swatch opens the color editor
+        if btn == MouseButton::Right {
+            for i in 0..PALETTE_COUNT {
+                if self.swatch_rect(i).contains_point((sx, sy)) {
+                    self.color_edit = Some(ColorTarget::Swatch(i));
+                    return;
+                }
+            }
+            if self.bg_rect().contains_point((sx, sy)) {
+                self.color_edit = Some(ColorTarget::Bg);
+                return;
+            }
+        }
         // UI chrome first
         if self.ui_hit(sx, sy) {
             self.ui_click(sx, sy);
@@ -481,6 +588,22 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         }
         match self.tool {
             UiTool::Select => {
+                // resize handles on the selected bounded text come first
+                if let Some((SelKind::Text, tid)) = self.selection {
+                    let mut handled = false;
+                    for corner in 0..4u8 {
+                        if let Some((hx, hy)) = self.text_handle_pos(tid, corner) {
+                            if (sx - hx).abs() < 12 && (sy - hy).abs() < 12 {
+                                self.drag = DragKind::ResizeText(tid, corner);
+                                handled = true;
+                                break;
+                            }
+                        }
+                    }
+                    if handled {
+                        return;
+                    }
+                }
                 if let Some((kind, id)) = self.hit_test(wx, wy) {
                     // double-click on text -> edit it
                     let now = Instant::now();
@@ -493,6 +616,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                             self.text_edit = Some(TextEdit {
                                 x: t.x,
                                 y: t.y,
+                                bw: t.box_w,
+                                bh: t.box_h,
                                 buf: t.text.clone(),
                                 existing: Some(id),
                             });
@@ -521,9 +646,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             }
             UiTool::Pan => {}
             UiTool::Text => {
-                // click empty space -> new text; double-click existing -> edit (via select path above is for V)
-                self.text_edit = Some(TextEdit { x: wx, y: wy, buf: String::new(), existing: None });
-                video.text_input().start();
+                // press -> potential box drag; release without dragging -> point text
+                self.drag = DragKind::TextBox;
+                self.tbox = Some((wx, wy, wx, wy));
             }
             t if t.draw_tool().is_some() => {
                 let tool = t.draw_tool().unwrap();
@@ -558,6 +683,13 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.cam.cx = self.pan_cx - dx;
                 self.cam.cy = self.pan_cy - dy;
             }
+            DragKind::TextBox => {
+                let (wx, wy) = self.cam.screen_to_world(sx as f32, sy as f32, self.win_w as f32, self.win_h as f32);
+                if let Some(tb) = &mut self.tbox {
+                    tb.2 = wx;
+                    tb.3 = wy;
+                }
+            }
             DragKind::MoveItem => {
                 let (wx0, wy0) = self.cam.screen_to_world(self.drag_sx, self.drag_sy, self.win_w as f32, self.win_h as f32);
                 let (wx1, wy1) = self.cam.screen_to_world(sx as f32, sy as f32, self.win_w as f32, self.win_h as f32);
@@ -591,13 +723,74 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     }
                 }
             }
+            DragKind::PalSlider(ch) => {
+                for ch2 in 0..3u8 {
+                    let r = self.pal_slider_rect(ch2);
+                    if ch2 == ch {
+                        let t = ((sx - r.x()) as f32 / r.width() as f32).clamp(0.0, 1.0);
+                        self.set_edit_channel(ch2, (t * 255.0).round() as u8);
+                    }
+                }
+            }
+            DragKind::ResizeText(id, corner) => {
+                let (wx, wy) = self.cam.screen_to_world(sx as f32, sy as f32, self.win_w as f32, self.win_h as f32);
+                let mut tm = match self.doc.data.texts.iter().find(|t| t.id == id).cloned() {
+                    Some(t) => t,
+                    None => return,
+                };
+                if tm.box_w <= 0.0 {
+                    return;
+                }
+                let (x0, y0, x1, y1) = (tm.x, tm.y, tm.x + tm.box_w, tm.y + tm.box_h);
+                match corner {
+                    0 => {
+                        let nx = wx.min(x1 - 40.0);
+                        let ny = wy.min(y1 - 28.0);
+                        tm.x = nx; tm.y = ny; tm.box_w = x1 - nx; tm.box_h = y1 - ny;
+                    }
+                    1 => {
+                        let nx = wx.max(x0 + 40.0);
+                        let ny = wy.min(y1 - 28.0);
+                        tm.y = ny; tm.box_w = nx - x0; tm.box_h = y1 - ny;
+                    }
+                    2 => {
+                        let nx = wx.min(x1 - 40.0);
+                        let ny = wy.max(y0 + 28.0);
+                        tm.x = nx; tm.box_w = x1 - nx; tm.box_h = ny - y0;
+                    }
+                    _ => {
+                        let nx = wx.max(x0 + 40.0);
+                        let ny = wy.max(y0 + 28.0);
+                        tm.box_w = nx - x0; tm.box_h = ny - y0;
+                    }
+                }
+                if let Ok((tex, w, h)) = self.render_text(&tm) {
+                    tm.w = w;
+                    tm.h = h;
+                    if let Some(dst) = self.doc.data.texts.iter_mut().find(|t| t.id == id) {
+                        *dst = tm;
+                    }
+                    self.text_tex.insert(id, tex);
+                }
+            }
             DragKind::None => {}
         }
     }
 
     fn on_up(&mut self, _btn: MouseButton, video: &sdl2::VideoSubsystem) {
-        let _ = video;
         match self.drag {
+            DragKind::TextBox => {
+                if let Some((x0, y0, x1, y1)) = self.tbox.take() {
+                    let (bw, bh) = ((x1 - x0).abs(), (y1 - y0).abs());
+                    let (x, y) = (x0.min(x1), y0.min(y1));
+                    if bw > 12.0 / self.cam.zoom && bh > 12.0 / self.cam.zoom {
+                        self.text_edit = Some(TextEdit { x, y, bw, bh, buf: String::new(), existing: None });
+                    } else {
+                        self.text_edit = Some(TextEdit { x: x0, y: y0, bw: 0.0, bh: 0.0, buf: String::new(), existing: None });
+                    }
+                    video.text_input().start();
+                }
+            }
             DragKind::Stroke => {
                 if let Some(st) = self.active_stroke.take() {
                     if !st.points.is_empty() {
@@ -661,7 +854,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
 
         match keycode {
             Some(Keycode::Escape) => {
-                if self.show_help {
+                if self.color_edit.is_some() {
+                    self.color_edit = None;
+                } else if self.show_help {
                     self.show_help = false;
                 } else if self.drag != DragKind::None {
                     self.drag = DragKind::None;
@@ -725,26 +920,40 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             let text = ed.buf.trim().to_string();
             if !text.is_empty() {
                 if let Some(id) = ed.existing {
-                    let color = self.color_idx_of_text(id);
-                    let size = self.doc.data.texts.iter().find(|t| t.id == id).map(|t| t.size).unwrap_or(32.0);
-                    if let Ok((tex, w, h)) = self.make_text_texture(&text, color, size) {
-                        self.doc.set_text(id, text, w, h);
-                        self.text_tex.insert(id, tex);
+                    if let Some(tm) = self.doc.data.texts.iter().find(|t| t.id == id).cloned() {
+                        let mut tm2 = tm;
+                        tm2.text = text;
+                        // keep the existing box/align/shape; re-render
+                        if let Ok((tex, w, h)) = self.render_text(&tm2) {
+                            tm2.w = w;
+                            tm2.h = h;
+                            if let Some(dst) = self.doc.data.texts.iter_mut().find(|t| t.id == id) {
+                                *dst = tm2;
+                            }
+                            self.text_tex.insert(id, tex);
+                        }
                     }
                 } else {
-                    let color = self.color_idx;
-                    if let Ok((tex, w, h)) = self.make_text_texture(&text, color, 32.0) {
-                        let id = self.doc.alloc_id();
-                        self.doc.add_text(TextMeta {
-                            id,
-                            text,
-                            x: ed.x,
-                            y: ed.y,
-                            size: 32.0,
-                            color,
-                            w,
-                            h,
-                        });
+                    let tm = TextMeta {
+                        id: self.doc.alloc_id(),
+                        text,
+                        x: ed.x,
+                        y: ed.y,
+                        size: 32.0,
+                        color: self.color_idx,
+                        w: ed.bw,
+                        h: ed.bh,
+                        box_w: ed.bw,
+                        box_h: ed.bh,
+                        align: 0,
+                        shape: 0,
+                    };
+                    if let Ok((tex, w, h)) = self.render_text(&tm) {
+                        let mut tm2 = tm;
+                        tm2.w = w;
+                        tm2.h = h;
+                        let id = tm2.id;
+                        self.doc.add_text(tm2);
                         self.text_tex.insert(id, tex);
                         self.selection = Some((SelKind::Text, id));
                     }
@@ -759,9 +968,6 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         video.text_input().stop();
     }
 
-    fn color_idx_of_text(&self, id: u64) -> usize {
-        self.doc.data.texts.iter().find(|t| t.id == id).map(|t| t.color).unwrap_or(0)
-    }
 
     fn set_tool(&mut self, t: UiTool) {
         self.tool = t;
@@ -835,7 +1041,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         }
         for t in &self.doc.data.texts.clone() {
             if !self.text_tex.contains_key(&t.id) {
-                if let Ok((tex, _, _)) = self.make_text_texture(&t.text, t.color, t.size) {
+                if let Ok((tex, _, _)) = self.render_text(t) {
                     self.text_tex.insert(t.id, tex);
                 }
             }
@@ -867,12 +1073,16 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         // advance vector animations
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = Instant::now();
+        // fade the chrome while typing or drawing so it never blocks the canvas
+        let target = if self.text_edit.is_some() || self.active_stroke.is_some() { 0.22 } else { 1.0 };
+        let k = (dt * 9.0).min(1.0);
+        self.ui_fade += (target - self.ui_fade) * k;
         for v in self.doc.data.vectors.iter_mut() {
             if v.playing && v.anim.animated() {
                 v.t += dt;
             }
         }
-        self.canvas.set_draw_color(PAPER);
+        self.canvas.set_draw_color(self.bg_color());
         self.canvas.clear();
         self.draw_grid();
         self.draw_tiles()?;
@@ -881,9 +1091,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.draw_texts()?;
         self.draw_active_stroke()?;
         self.draw_selection();
+        self.draw_tbox_rubber()?;
         self.draw_text_edit()?;
+        self.canvas.set_blend_mode(BlendMode::Blend);
         self.draw_chrome()?;
         self.draw_vector_panel()?;
+        self.draw_text_panel()?;
+        self.canvas.set_blend_mode(BlendMode::None);
+        self.draw_color_popup()?;
         if self.show_help {
             self.draw_help()?;
         }
@@ -965,7 +1180,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             (Some(m), Some(p)) => (m.clone(), p.clone()),
             _ => return false,
         };
-        let col = PALETTE[meta.color % PALETTE_COUNT].color;
+        let col = self.pal(meta.color);
         let (buf, bw, bh) = render_frame(&meta, &polys, (col.r, col.g, col.b));
         let mut owned = buf;
         let surf = match sdl2::surface::Surface::from_data(&mut owned, bw, bh, bw * 4, PixelFormatEnum::RGBA32) {
@@ -1040,6 +1255,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn draw_vector_panel(&mut self) -> Result<(), String> {
+        self.label_fade = self.ui_fade;
         self.panel_hits.clear();
         self.panel_speed = None;
         let (anim, playing, filled, speed) = match self.selection {
@@ -1055,9 +1271,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         };
         let (px, py) = (pr.x(), pr.y());
         let pw = pr.width() as i32;
-        self.canvas.set_draw_color(CHROME2);
+        self.cc(CHROME2);
         self.canvas.fill_rect(SdlRect::new(px, py, pw as u32, 42))?;
-        self.canvas.set_draw_color(ACCENT);
+        self.cc(ACCENT);
         self.canvas.draw_rect(SdlRect::new(px, py, pw as u32, 42))?;
         let mut x = px + 8;
         for k in AnimKind::all() {
@@ -1077,13 +1293,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.draw_label("speed", DIM, x, py + 12)?;
         x += 52;
         let sr = SdlRect::new(x, py + 7, 110, 28);
-        self.canvas.set_draw_color(CHROME);
+        self.cc(CHROME);
         self.canvas.fill_rect(sr)?;
         let t = ((speed - 0.25) / 2.75).clamp(0.0, 1.0);
         let fx = sr.x() + (t * sr.width() as f32) as i32;
-        self.canvas.set_draw_color(ACCENT);
+        self.cc(ACCENT);
         self.canvas.fill_rect(SdlRect::new(fx - 3, sr.y(), 6, sr.height()))?;
         self.panel_speed = Some(sr);
+        self.label_fade = 1.0;
         Ok(())
     }
 
@@ -1167,6 +1384,36 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         Ok(())
     }
 
+    fn draw_text_shape(&mut self, t: &TextMeta, x: f32, y: f32) -> Result<(), String> {
+        if t.shape == 0 || t.box_w <= 0.0 {
+            return Ok(());
+        }
+        let cam = self.cam;
+        let (w, h) = (self.win_w as f32, self.win_h as f32);
+        let col = self.pal(t.color);
+        self.canvas.set_draw_color(col);
+        if t.shape == 1 {
+            let (sx, sy) = cam.world_to_screen(x, y, w, h);
+            let (ex, ey) = cam.world_to_screen(x + t.box_w, y + t.box_h, w, h);
+            self.canvas.draw_rect(SdlRect::new(sx as i32, sy as i32, (ex - sx).max(1.0) as u32, (ey - sy).max(1.0) as u32))?;
+        } else {
+            // ellipse outline, 64 segments
+            let (cx, cy) = (x + t.box_w / 2.0, y + t.box_h / 2.0);
+            let (rx, ry) = (t.box_w / 2.0, t.box_h / 2.0);
+            let mut prev: Option<(i32, i32)> = None;
+            for i in 0..=64 {
+                let a = i as f32 / 64.0 * std::f32::consts::TAU;
+                let (sx, sy) = cam.world_to_screen(cx + rx * a.cos(), cy + ry * a.sin(), w, h);
+                let p = (sx as i32, sy as i32);
+                if let Some(q) = prev {
+                    self.canvas.draw_line(q, p)?;
+                }
+                prev = Some(p);
+            }
+        }
+        Ok(())
+    }
+
     fn draw_texts(&mut self) -> Result<(), String> {
         let cam = self.cam;
         let (w, h) = (self.win_w as f32, self.win_h as f32);
@@ -1180,6 +1427,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 (t.id, t.x + dx, t.y + dy, t.w, t.h)
             })
             .collect();
+        // shape outlines under the text
+        for t in &self.doc.data.texts.clone() {
+            let (dx, dy) = self.move_delta_for(SelKind::Text, t.id);
+            self.draw_text_shape(t, t.x + dx, t.y + dy)?;
+        }
         for (id, x, y, iw, ih) in items {
             let (sx, sy) = cam.world_to_screen(x, y, w, h);
             let dw = (iw * cam.zoom).max(1.0) as u32;
@@ -1203,11 +1455,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let (w, h) = (self.win_w as f32, self.win_h as f32);
         let dpx = (st.size * cam.zoom).max(2.0) as u32;
         // borrow juggling: get tip, then stamp
+        let col = self.pal(st.color);
         let tc = self.tc;
         let tips = &mut self.tips;
         let canvas = &mut self.canvas;
         let tip = tips.get(tc, st.tool, dpx).map_err(|e| e)?;
-        let col = PALETTE[st.color % PALETTE_COUNT].color;
         tip.set_color_mod(col.r, col.g, col.b);
         let scr: Vec<(f32, f32)> = st.points.iter().map(|&(x, y)| cam.world_to_screen(x, y, w, h)).collect();
         for pair in scr.windows(2) {
@@ -1251,19 +1503,73 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 (sx1 - sx0 + 8.0).max(4.0) as u32,
                 (sy1 - sy0 + 8.0).max(4.0) as u32,
             ));
+            // resize handles for bounded text
+            if kind == SelKind::Text {
+                for corner in 0..4u8 {
+                    if let Some((hx, hy)) = self.text_handle_pos(id, corner) {
+                        self.canvas.set_draw_color(ACCENT);
+                        let _ = self.canvas.fill_rect(SdlRect::new(hx - 5, hy - 5, 10, 10));
+                    }
+                }
+            }
         }
     }
 
+    /// Screen-space corner handle positions for the selected bounded text.
+    fn text_handle_pos(&self, id: u64, corner: u8) -> Option<(i32, i32)> {
+        let t = self.doc.data.texts.iter().find(|t| t.id == id)?;
+        if t.box_w <= 0.0 {
+            return None;
+        }
+        let (wx, wy) = match corner {
+            0 => (t.x, t.y),
+            1 => (t.x + t.box_w, t.y),
+            2 => (t.x, t.y + t.box_h),
+            _ => (t.x + t.box_w, t.y + t.box_h),
+        };
+        let (sx, sy) = self.cam.world_to_screen(wx, wy, self.win_w as f32, self.win_h as f32);
+        Some((sx as i32, sy as i32))
+    }
+
+    fn draw_tbox_rubber(&mut self) -> Result<(), String> {
+        if self.drag != DragKind::TextBox {
+            return Ok(());
+        }
+        if let Some((x0, y0, x1, y1)) = self.tbox {
+            if (x1 - x0).abs() < 4.0 || (y1 - y0).abs() < 4.0 {
+                return Ok(());
+            }
+            let cam = self.cam;
+            let (w, h) = (self.win_w as f32, self.win_h as f32);
+            let (sx0, sy0) = cam.world_to_screen(x0.min(x1), y0.min(y1), w, h);
+            let (sx1, sy1) = cam.world_to_screen(x0.max(x1), y0.max(y1), w, h);
+            self.canvas.set_draw_color(ACCENT);
+            self.canvas.draw_rect(SdlRect::new(
+                sx0 as i32, sy0 as i32,
+                (sx1 - sx0).max(1.0) as u32, (sy1 - sy0).max(1.0) as u32,
+            ))?;
+        }
+        Ok(())
+    }
+
     fn draw_text_edit(&mut self) -> Result<(), String> {
-        let (ex, ey, buf) = match &self.text_edit {
-            Some(e) => (e.x, e.y, e.buf.clone()),
+        let (ex, ey, bw, bh, buf) = match &self.text_edit {
+            Some(e) => (e.x, e.y, e.bw, e.bh, e.buf.clone()),
             None => return Ok(()),
         };
         let (w, h) = (self.win_w as f32, self.win_h as f32);
         let (sx, sy) = self.cam.world_to_screen(ex, ey, w, h);
+        if bw > 0.0 && bh > 0.0 {
+            let (ex2, ey2) = self.cam.world_to_screen(ex + bw, ey + bh, w, h);
+            self.canvas.set_draw_color(ACCENT);
+            let _ = self.canvas.draw_rect(SdlRect::new(
+                sx as i32, sy as i32,
+                (ex2 - sx).max(1.0) as u32, (ey2 - sy).max(1.0) as u32,
+            ));
+        }
         let label = if buf.is_empty() { "type here" } else { &buf };
         let dim = buf.is_empty();
-        self.draw_label(label, if dim { DIM } else { PALETTE[self.color_idx].color }, sx as i32, sy as i32)?;
+        self.draw_label(label, if dim { DIM } else { self.pal(self.color_idx) }, sx as i32, sy as i32)?;
         // caret
         if self.start.elapsed().as_millis() % 1000 < 500 {
             let adv = self.font_ui.size_of(label).map(|(tw, _)| tw).unwrap_or(0);
@@ -1285,7 +1591,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             let tex = self.tc.create_texture_from_surface(&surf).map_err(|e| e.to_string())?;
             self.label_cache.insert(key.clone(), tex);
         }
-        let tex = &self.label_cache[&key];
+        let tex = self.label_cache.get_mut(&key).ok_or("label")?;
+        tex.set_alpha_mod((255.0 * self.label_fade) as u8);
         let q = tex.query();
         let dst = SdlRect::new(x, y, q.width, q.height);
         self.canvas.copy(tex, None, dst).map_err(|e| e.to_string())?;
@@ -1295,7 +1602,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn button(&mut self, r: SdlRect, label: &str, active: bool) -> Result<(), String> {
         let bg = if active { ACCENT } else { CHROME2 };
         let fg = if active { Color::RGB(0x20, 0x18, 0x08) } else { INK };
-        self.canvas.set_draw_color(bg);
+        self.cc(bg);
         self.canvas.fill_rect(r)?;
         let (tw, th) = self.font_ui.size_of(label).unwrap_or((0, 0));
         self.draw_label(
@@ -1307,38 +1614,296 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         Ok(())
     }
 
+    fn draw_color_popup(&mut self) -> Result<(), String> {
+        let target = match self.color_edit {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let pr = self.color_popup_rect();
+        self.canvas.set_draw_color(CHROME);
+        self.canvas.fill_rect(pr)?;
+        self.canvas.set_draw_color(INK);
+        self.canvas.draw_rect(pr)?;
+        let title = match target {
+            ColorTarget::Swatch(i) => format!("swatch: {}", PALETTE[i % PALETTE_COUNT].name),
+            ColorTarget::Bg => "canvas background".to_string(),
+        };
+        self.draw_label(&title, INK, pr.x() + 14, pr.y() + 10)?;
+        // preview
+        let rgb = self.edit_rgb();
+        let pv = SdlRect::new(pr.x() + 14, pr.y() + 34, pr.width() - 28, 30);
+        self.canvas.set_draw_color(Color::RGB(rgb[0], rgb[1], rgb[2]));
+        self.canvas.fill_rect(pv)?;
+        self.canvas.set_draw_color(INK);
+        self.canvas.draw_rect(pv)?;
+        // RGB sliders
+        for (ch, name) in [(0u8, "R"), (1u8, "G"), (2u8, "B")] {
+            let r = self.pal_slider_rect(ch);
+            self.draw_label(name, DIM, pr.x() + 14, r.y())?;
+            self.canvas.set_draw_color(CHROME2);
+            self.canvas.fill_rect(r)?;
+            let t = rgb[ch as usize] as f32 / 255.0;
+            let fw = (t * r.width() as f32) as i32;
+            let bar = match ch {
+                0 => Color::RGB(200, 60, 60),
+                1 => Color::RGB(60, 160, 80),
+                _ => Color::RGB(60, 100, 200),
+            };
+            self.canvas.set_draw_color(bar);
+            self.canvas.fill_rect(SdlRect::new(r.x(), r.y(), fw.max(2) as u32, r.height()))?;
+            self.canvas.set_draw_color(INK);
+            self.canvas.draw_rect(r)?;
+            self.draw_label(&format!("{}", rgb[ch as usize]), DIM, r.x() + r.width() as i32 + 8, r.y())?;
+        }
+        self.draw_label("esc to close", DIM, pr.x() + 14, pr.y() + pr.height() as i32 - 24)?;
+        Ok(())
+    }
+
+    fn text_panel_action(&mut self, act: TextPanelAction) {
+        let id = match self.selection {
+            Some((SelKind::Text, id)) => id,
+            _ => return,
+        };
+        let mut tm = match self.doc.data.texts.iter().find(|t| t.id == id).cloned() {
+            Some(t) => t,
+            None => return,
+        };
+        match act {
+            TextPanelAction::Shape(s2) => tm.shape = s2,
+            TextPanelAction::Align(a) => tm.align = a,
+            TextPanelAction::Size(d) => tm.size = (tm.size + d).clamp(8.0, 220.0),
+        }
+        if let Ok((tex, w, h)) = self.render_text(&tm) {
+            tm.w = w;
+            tm.h = h;
+            if let Some(dst) = self.doc.data.texts.iter_mut().find(|t| t.id == id) {
+                *dst = tm;
+            }
+            self.text_tex.insert(id, tex);
+        }
+    }
+
+    fn draw_text_panel(&mut self) -> Result<(), String> {
+        self.text_panel_hits.clear();
+        let (align, shape, size) = match self.selection {
+            Some((SelKind::Text, id)) => match self.doc.data.texts.iter().find(|t| t.id == id) {
+                Some(t) => (t.align, t.shape, t.size),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let pr = match self.text_panel_rect() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        self.label_fade = self.ui_fade;
+        let (px, py) = (pr.x(), pr.y());
+        let pw = pr.width() as i32;
+        self.cc(CHROME2);
+        self.canvas.fill_rect(SdlRect::new(px, py, pw as u32, 42))?;
+        self.cc(ACCENT);
+        self.canvas.draw_rect(SdlRect::new(px, py, pw as u32, 42))?;
+        let mut x = px + 8;
+        // shape: none / rect / oval
+        for (si, label) in [(0u8, "No"), (1u8, "Rect"), (2u8, "Oval")] {
+            let r = SdlRect::new(x, py + 7, 52, 28);
+            self.button(r, label, shape == si)?;
+            self.text_panel_hits.push((r, TextPanelAction::Shape(si)));
+            x += 58;
+        }
+        x += 8;
+        for (ai, label) in [(0u8, "Left"), (1u8, "Ctr"), (2u8, "Right")] {
+            let r = SdlRect::new(x, py + 7, 52, 28);
+            self.button(r, label, align == ai)?;
+            self.text_panel_hits.push((r, TextPanelAction::Align(ai)));
+            x += 58;
+        }
+        x += 8;
+        for (d, label) in [(-6.0f32, "A-"), (6.0f32, "A+")] {
+            let r = SdlRect::new(x, py + 7, 44, 28);
+            self.button(r, label, false)?;
+            self.text_panel_hits.push((r, TextPanelAction::Size(d)));
+            x += 50;
+        }
+        self.draw_label(&format!("{:.0}", size), DIM, x + 4, py + 12)?;
+        self.label_fade = 1.0;
+        Ok(())
+    }
+
+    fn fill_tri(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32) -> Result<(), String> {
+        // scanline-filled triangle
+        let (mut xa, mut ya) = (x0, y0);
+        let (mut xb, mut yb) = (x1, y1);
+        let (mut xc, mut yc) = (x2, y2);
+        if ya > yb { std::mem::swap(&mut xa, &mut xb); std::mem::swap(&mut ya, &mut yb); }
+        if ya > yc { std::mem::swap(&mut xa, &mut xc); std::mem::swap(&mut ya, &mut yc); }
+        if yb > yc { std::mem::swap(&mut xb, &mut xc); std::mem::swap(&mut yb, &mut yc); }
+        let lerp_x = |x0: i32, y0: i32, x1: i32, y1: i32, y: i32| -> i32 {
+            if y1 == y0 { return x0; }
+            x0 + (x1 - x0) * (y - y0) / (y1 - y0)
+        };
+        for y in ya..=yc {
+            let (x1, x2) = if y < yb {
+                (lerp_x(xa, ya, xb, yb, y), lerp_x(xa, ya, xc, yc, y))
+            } else {
+                (lerp_x(xb, yb, xc, yc, y), lerp_x(xa, ya, xc, yc, y))
+            };
+            let (x1, x2) = (x1.min(x2), x1.max(x2));
+            self.canvas.draw_line((x1, y), (x2, y))?;
+        }
+        Ok(())
+    }
+    fn fill_circ(&mut self, cx: i32, cy: i32, rad: i32) -> Result<(), String> {
+        for y in -rad..=rad {
+            let hw = ((rad * rad - y * y) as f32).sqrt() as i32;
+            self.canvas.draw_line((cx - hw, cy + y), (cx + hw, cy + y))?;
+        }
+        Ok(())
+    }
+    fn thick_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, w: i32) -> Result<(), String> {
+        for o in -w / 2..=w / 2 {
+            self.canvas.draw_line((x0 + o, y0), (x1 + o, y1))?;
+            self.canvas.draw_line((x0, y0 + o), (x1, y1 + o))?;
+        }
+        Ok(())
+    }
+
+    fn draw_tool_icon(&mut self, tool: UiTool, r: SdlRect, fg: Color, bg: Color) -> Result<(), String> {
+        let cx = r.x() + r.width() as i32 / 2;
+        let cy = r.y() + r.height() as i32 / 2;
+        self.cc(fg);
+        match tool {
+            UiTool::Select => {
+                // cursor arrow
+                self.fill_tri(cx - 7, cy - 11, cx - 7, cy + 9, cx + 9, cy + 1)?;
+                self.cc(bg);
+                self.fill_tri(cx - 4, cy - 8, cx - 4, cy + 6, cx + 5, cy + 1)?;
+            }
+            UiTool::Pan => {
+                // four-way move arrows
+                for (dx, dy) in [(0, -1), (0, 1), (-1, 0), (1, 0)] {
+                    let (x1, y1) = (cx + dx * 11, cy + dy * 11);
+                    self.canvas.draw_line((cx, cy), (x1, y1))?;
+                    let (px, py) = (-dy, dx);
+                    self.canvas.draw_line((x1, y1), (x1 - dx * 4 + px * 3, y1 - dy * 4 + py * 3))?;
+                    self.canvas.draw_line((x1, y1), (x1 - dx * 4 - px * 3, y1 - dy * 4 - py * 3))?;
+                }
+                self.fill_circ(cx, cy, 2)?;
+            }
+            UiTool::Pencil => {
+                self.thick_line(cx - 8, cy + 8, cx + 5, cy - 5, 5)?;
+                self.fill_tri(cx + 5, cy - 5, cx + 11, cy - 11, cx + 2, cy - 8)?;
+                self.canvas.fill_rect(SdlRect::new(cx - 11, cy + 5, 7, 7))?;
+            }
+            UiTool::Pen => {
+                // fountain nib
+                self.fill_tri(cx, cy - 11, cx + 7, cy + 1, cx - 7, cy + 1)?;
+                self.fill_tri(cx, cy + 11, cx + 7, cy + 1, cx - 7, cy + 1)?;
+                self.cc(bg);
+                self.canvas.draw_line((cx, cy - 9), (cx, cy - 1))?;
+                self.fill_circ(cx, cy + 4, 2)?;
+            }
+            UiTool::Marker => {
+                // chisel tip parallelogram
+                self.fill_tri(cx - 9, cy + 8, cx + 1, cy - 10, cx + 9, cy - 10)?;
+                self.fill_tri(cx - 9, cy + 8, cx - 1, cy + 8, cx + 9, cy - 10)?;
+                self.cc(bg);
+                self.canvas.draw_line((cx - 9, cy + 8), (cx - 1, cy + 8))?;
+            }
+            UiTool::OilStick => {
+                self.fill_circ(cx - 2, cy - 2, 9)?;
+                self.fill_circ(cx + 8, cy + 7, 4)?;
+                self.cc(bg);
+                self.fill_circ(cx - 5, cy - 5, 3)?;
+            }
+            UiTool::Text => {
+                self.draw_label("A", fg, cx - 8, cy - 11)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_top_icon(&mut self, kind: u8, r: SdlRect, fg: Color) -> Result<(), String> {
+        // kind: 0 save, 1 vectorize, 2 export png
+        let cx = r.x() + r.width() as i32 / 2;
+        let cy = r.y() + r.height() as i32 / 2;
+        self.cc(fg);
+        match kind {
+            0 => {
+                // floppy disk
+                self.canvas.draw_rect(SdlRect::new(cx - 9, cy - 7, 18, 14))?;
+                self.canvas.fill_rect(SdlRect::new(cx - 5, cy - 7, 10, 6))?;
+                self.canvas.draw_line((cx - 5, cy + 4), (cx + 5, cy + 4))?;
+            }
+            1 => {
+                // hexagon (vector nodes)
+                let pts = [(9, 0), (4, 8), (-4, 8), (-9, 0), (-4, -8), (4, -8)];
+                for i in 0..6 {
+                    let (x0, y0) = pts[i];
+                    let (x1, y1) = pts[(i + 1) % 6];
+                    self.canvas.draw_line((cx + x0, cy + y0), (cx + x1, cy + y1))?;
+                }
+                self.fill_circ(cx, cy, 2)?;
+            }
+            _ => {
+                // picture: mountains + sun
+                self.canvas.draw_rect(SdlRect::new(cx - 10, cy - 7, 20, 14))?;
+                self.fill_tri(cx - 10, cy + 7, cx - 3, cy - 3, cx + 2, cy + 7)?;
+                self.fill_tri(cx - 2, cy + 7, cx + 5, cy - 1, cx + 10, cy + 7)?;
+                self.fill_circ(cx + 5, cy - 3, 2)?;
+            }
+        }
+        Ok(())
+    }
+
     fn draw_chrome(&mut self) -> Result<(), String> {
+        self.label_fade = self.ui_fade;
         let (w, h) = (self.win_w as i32, self.win_h as i32);
         // top bar
-        self.canvas.set_draw_color(CHROME);
+        self.cc(CHROME);
         self.canvas.fill_rect(SdlRect::new(0, 0, w as u32, TOP_H as u32))?;
         self.draw_label("MURAL", ACCENT, 12, 12)?;
         let zoom_txt = format!("{}%", (self.cam.zoom * 100.0).round() as i32);
-        self.draw_label(&zoom_txt, DIM, w - 320, 12)?;
-        // top-right buttons
-        self.button(SdlRect::new(w - 292, 8, 64, 28), "Save", false)?;
-        self.button(SdlRect::new(w - 220, 8, 64, 28), "Vec", false)?;
-        self.button(SdlRect::new(w - 148, 8, 64, 28), "PNG", false)?;
+        self.draw_label(&zoom_txt, DIM, w - 440, 12)?;
+        // background color swatch (right-click edits)
+        let br = self.bg_rect();
+        self.cc(self.bg_color());
+        self.canvas.fill_rect(br)?;
+        self.cc(INK);
+        self.canvas.draw_rect(br)?;
+        self.draw_label("BG", DIM, br.x() + 20, br.y() + 6)?;
+        // top-right buttons (icons)
+        for (i, bx) in [w - 292, w - 220, w - 148].iter().enumerate() {
+            let r = SdlRect::new(*bx, 8, 64, 28);
+            self.cc(CHROME2);
+            self.canvas.fill_rect(r)?;
+            self.draw_top_icon(i as u8, r, INK)?;
+        }
         self.button(SdlRect::new(w - 76, 8, 64, 28), "?", self.show_help)?;
         // left toolbar
-        self.canvas.set_draw_color(CHROME);
+        self.cc(CHROME);
         self.canvas.fill_rect(SdlRect::new(0, TOP_H, TOOL_W as u32, (h - TOP_H - BOT_H) as u32))?;
         for (i, t) in TOOLS.iter().enumerate() {
             let r = self.tool_rect(i);
             let active = *t == self.tool;
-            self.button(r, t.shortcut(), active)?;
+            let bgc = if active { ACCENT } else { CHROME2 };
+            let fgc = if active { Color::RGB(0x20, 0x18, 0x08) } else { INK };
+            self.cc(bgc);
+            self.canvas.fill_rect(r)?;
+            self.draw_tool_icon(*t, r, fgc, bgc)?;
+            self.draw_label(t.shortcut(), DIM, r.x() + r.width() as i32 - 15, r.y() + r.height() as i32 - 15)?;
             self.draw_label(t.label(), DIM, r.x() - 2, r.y() + r.height() as i32 + 1)?;
         }
         // bottom bar
-        self.canvas.set_draw_color(CHROME);
+        self.cc(CHROME);
         self.canvas.fill_rect(SdlRect::new(0, h - BOT_H, w as u32, BOT_H as u32))?;
         for i in 0..PALETTE_COUNT {
             let r = self.swatch_rect(i);
-            let c = PALETTE[i].color;
-            self.canvas.set_draw_color(c);
+            let c = self.pal(i);
+            self.cc(c);
             self.canvas.fill_rect(r)?;
             if i == self.color_idx {
-                self.canvas.set_draw_color(INK);
+                self.cc(INK);
                 self.canvas.draw_rect(r)?;
                 let r2 = SdlRect::new(r.x() - 2, r.y() - 2, r.width() + 4, r.height() + 4);
                 self.canvas.draw_rect(r2)?;
@@ -1348,16 +1913,17 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.draw_label(cname, DIM, TOOL_W + 12, h - 20)?;
         // brush slider
         let sr = self.slider_rect();
-        self.canvas.set_draw_color(CHROME2);
+        self.cc(CHROME2);
         self.canvas.fill_rect(sr)?;
         let t = (self.brush_size() - 1.0) / 95.0;
         let fx = sr.x() + (t * sr.width() as f32) as i32;
-        self.canvas.set_draw_color(ACCENT);
+        self.cc(ACCENT);
         self.canvas.fill_rect(SdlRect::new(fx - 3, sr.y(), 6, sr.height()))?;
         self.draw_label(&format!("size {:.0}", self.brush_size()), DIM, sr.x(), sr.y() - 20)?;
         // undo/redo state
         let ur = format!("{}/{}", if self.doc.can_undo() { "undo" } else { "-" }, if self.doc.can_redo() { "redo" } else { "-" });
         self.draw_label(&ur, DIM, w - 300, h - 20)?;
+        self.label_fade = 1.0;
         Ok(())
     }
 
@@ -1379,13 +1945,48 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                         self.vec_tex.remove(&id);
                     }
                 }
+                if let Some((SelKind::Text, id)) = self.selection {
+                    if let Some(tm) = self.doc.data.texts.iter().find(|t| t.id == id).cloned() {
+                        let mut tm2 = tm;
+                        tm2.color = i;
+                        if let Ok((tex, _, _)) = self.render_text(&tm2) {
+                            if let Some(dst) = self.doc.data.texts.iter_mut().find(|t| t.id == id) {
+                                *dst = tm2;
+                            }
+                            self.text_tex.insert(id, tex);
+                        }
+                    }
+                }
                 return;
             }
+        }
+        // color editor popup: sliders start drags; clicking outside closes
+        if self.color_edit.is_some() {
+            for ch in 0..3u8 {
+                let r = self.pal_slider_rect(ch);
+                if r.contains_point((sx, sy)) {
+                    self.drag = DragKind::PalSlider(ch);
+                    let t = ((sx - r.x()) as f32 / r.width() as f32).clamp(0.0, 1.0);
+                    self.set_edit_channel(ch, (t * 255.0).round() as u8);
+                    return;
+                }
+            }
+            if !self.color_popup_rect().contains_point((sx, sy)) {
+                self.color_edit = None;
+            }
+            return;
         }
         // vector panel hits
         for (r, act) in self.panel_hits.clone() {
             if r.contains_point((sx, sy)) {
                 self.panel_action(act);
+                return;
+            }
+        }
+        // text panel hits
+        for (r, act) in self.text_panel_hits.clone() {
+            if r.contains_point((sx, sy)) {
+                self.text_panel_action(act);
                 return;
             }
         }
@@ -1405,6 +2006,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         }
         // top-right buttons
         let w = self.win_w as i32;
+        if self.bg_rect().contains_point((sx, sy)) {
+            self.color_edit = Some(ColorTarget::Bg);
+            return;
+        }
         if SdlRect::new(w - 292, 8, 64, 28).contains_point((sx, sy)) {
             self.save_doc();
             return;
@@ -1425,7 +2030,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn draw_help(&mut self) -> Result<(), String> {
         let (w, h) = (self.win_w as i32, self.win_h as i32);
         let bw = 480;
-        let bh = 470;
+        let bh = 540;
         let bx = (w - bw) / 2;
         let by = (h - bh) / 2;
         self.canvas.set_draw_color(Color::RGBA(10, 10, 14, 230));
@@ -1436,14 +2041,18 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "MURAL — shortcuts",
             "",
             "V move/select   H pan (or space / mid-drag)",
-            "P pencil  N pen  M marker  O oil stick  T text",
+            "P pencil  N pen  M marker  O oil stick",
+            "T text: click = point text, drag = text box",
+            "text box panel: shape (no/rect/oval), align, size",
+            "drag box corners to resize; double-click to re-edit",
             "[ ] brush size   wheel zoom",
             "I import folder   drag & drop works too",
+            "right-click a color swatch to edit it; BG edits canvas",
             "del remove selected   esc deselect",
             "ctrl+Z / ctrl+Y undo / redo",
-            "ctrl+S save mural.json   ctrl+O open",
+            "ctrl+S save   ctrl+O open (file dialog)",
             "ctrl+E export PNG   ctrl+0 reset view",
-            "double-click text to re-edit",
+            "ui fades while typing or drawing",
             "",
             "paint sits above images, text above paint",
             "",
@@ -1491,13 +2100,119 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     // ---- text helpers ----
+    /// Word-wrap text into a box. Returns (line text, y_top, line_width, avail_width).
+    fn layout_text(&self, text: &str, size: f32, box_w: f32, box_h: f32, shape: u8) -> Vec<(String, f32, f32, f32)> {
+        let k = size / 64.0;
+        let (_, lh_px) = self.font_big.size_of("Ag").unwrap_or((0, 80));
+        let line_h = lh_px as f32 * k;
+        let pad = size * 0.4;
+        let measure = |t: &str| -> f32 {
+            self.font_big.size_of(t).map(|(w, _)| w as f32 * k).unwrap_or(0.0)
+        };
+        // width available for a line whose vertical center is at y
+        let width_at = |y: f32| -> f32 {
+            if shape == 2 {
+                let cy = box_h / 2.0;
+                let rx = (box_w / 2.0 - pad).max(1.0);
+                let ry = (box_h / 2.0 - pad).max(1.0);
+                let d = (y - cy) / ry;
+                if d.abs() >= 1.0 {
+                    return 0.0;
+                }
+                (2.0 * rx * (1.0 - d * d).sqrt()).max(0.0)
+            } else {
+                (box_w - 2.0 * pad).max(0.0)
+            }
+        };
+        let mut lines: Vec<(String, f32, f32, f32)> = vec![];
+        let mut y = pad;
+        let fits_vertically = |y: f32| -> bool { y <= box_h - pad };
+        for para in text.split('\n') {
+            let words: Vec<&str> = para.split_whitespace().collect();
+            // empty paragraph -> blank line
+            if words.is_empty() {
+                y += line_h;
+                continue;
+            }
+            let mut cur = String::new();
+            let mut cur_w = 0.0f32;
+            let space_w = measure(" ");
+            for word in words {
+                if !fits_vertically(y) {
+                    cur.clear();
+                    break;
+                }
+                let ww = measure(word);
+                let avail = width_at(y + line_h / 2.0);
+                let need = if cur.is_empty() { ww } else { cur_w + space_w + ww };
+                if need <= avail || cur.is_empty() {
+                    if !cur.is_empty() {
+                        cur.push(' ');
+                        cur_w += space_w;
+                    }
+                    cur.push_str(word);
+                    cur_w += ww;
+                } else {
+                    let lw = measure(&cur).min(avail);
+                    lines.push((std::mem::take(&mut cur), y, lw, avail));
+                    y += line_h;
+                    cur.push_str(word);
+                    cur_w = ww;
+                }
+            }
+            if !cur.is_empty() && fits_vertically(y) {
+                let avail = width_at(y + line_h / 2.0);
+                let lw = measure(&cur).min(avail);
+                lines.push((cur, y, lw, avail));
+            }
+            y += line_h;
+        }
+        lines
+    }
+
+    /// Render a text box to a texture. Returns (texture, world w, world h).
+    fn render_text_box(&mut self, tm: &TextMeta) -> Result<(Texture<'tc>, f32, f32), String> {
+        let col = self.pal(tm.color);
+        let s = 64.0 / tm.size.max(4.0);
+        let tw = (tm.box_w * s).ceil().max(2.0) as u32;
+        let th = (tm.box_h * s).ceil().max(2.0) as u32;
+        let mut surf = sdl2::surface::Surface::new(tw, th, PixelFormatEnum::RGBA32)
+            .map_err(|e| e.to_string())?;
+        for (line, y_top, lw, wline) in self.layout_text(&tm.text, tm.size, tm.box_w, tm.box_h, tm.shape) {
+            if line.is_empty() {
+                continue;
+            }
+            let ls = self.font_big.render(&line).blended(col).map_err(|e| e.to_string())?;
+            let (lw_px, lh_px) = (ls.width(), ls.height());
+            let pad = tm.size * 0.4;
+            let x = match tm.align {
+                1 => pad + (wline - lw).max(0.0) / 2.0,
+                2 => pad + (wline - lw).max(0.0),
+                _ => pad,
+            };
+            ls.blit(None, &mut surf, Some(SdlRect::new((x * s) as i32, (y_top * s) as i32, lw_px, lh_px)))
+                .map_err(|e| e.to_string())?;
+        }
+        let tex = self.tc.create_texture_from_surface(&surf).map_err(|e| e.to_string())?;
+        Ok((tex, tm.box_w, tm.box_h))
+    }
+
+    /// Render any text (point or box) to a texture.
+    fn render_text(&mut self, tm: &TextMeta) -> Result<(Texture<'tc>, f32, f32), String> {
+        if tm.box_w > 0.0 && tm.box_h > 0.0 {
+            self.render_text_box(tm)
+        } else {
+            self.make_text_texture(&tm.text, tm.color, tm.size)
+        }
+    }
+
     fn make_text_texture(
         &mut self,
         text: &str,
         color_idx: usize,
         world_size: f32,
     ) -> Result<(Texture<'tc>, f32, f32), String> {
-        let col = PALETTE[color_idx % PALETTE_COUNT].color;
+        let col = self.pal(color_idx);
         let surf = self.font_big.render(text).blended(col).map_err(|e| e.to_string())?;
         let (pw, ph) = surf.size();
         let tex = self.tc.create_texture_from_surface(&surf).map_err(|e| e.to_string())?;
@@ -1680,7 +2395,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             let canvas = &mut self.canvas;
             canvas
                 .with_texture_canvas(&mut target, |c| {
-                    c.set_draw_color(PAPER);
+                    let b = doc.data.bg;
+                    c.set_draw_color(Color::RGB(b[0], b[1], b[2]));
                     c.clear();
                     for ((tx, ty), tile) in tiles {
                         let dx = *tx as f32 * TILE_PX - ox;
@@ -1805,6 +2521,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             color: 0,
             w,
             h,
+            box_w: 0.0,
+            box_h: 0.0,
+            align: 0,
+            shape: 0,
         });
         self.text_tex.insert(id, tex);
         // generated test image: high-contrast B/W checker (vectorize likes contrast)
@@ -1919,6 +2639,46 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         assert!(self.img_tex.is_empty(), "missing image must not load a texture");
         self.frame()?;
         std::fs::remove_file("mural.json").ok();
+        // bounded text: layout wraps, panel actions apply, resize works
+        let lines = self.layout_text("the quick brown fox jumps over the lazy dog", 32.0, 200.0, 200.0, 0);
+        assert!(lines.len() > 1, "long text must wrap, got {} lines", lines.len());
+        let elines = self.layout_text("the quick brown fox jumps over the lazy dog", 32.0, 200.0, 200.0, 2);
+        assert!(!elines.is_empty(), "ellipse layout must produce lines");
+        let btm = crate::canvas::TextMeta {
+            id: self.doc.alloc_id(), text: "the quick brown fox jumps over the lazy dog".into(),
+            x: 0.0, y: 0.0, size: 32.0, color: 4, w: 200.0, h: 120.0,
+            box_w: 200.0, box_h: 120.0, align: 0, shape: 1,
+        };
+        let (btex, bw, bh) = self.render_text(&btm).expect("render box text");
+        assert_eq!((bw, bh), (200.0, 120.0));
+        let bq = btex.query();
+        assert!(bq.width > 10 && bq.height > 10, "box texture has size");
+        self.doc.add_text(btm.clone());
+        self.text_tex.insert(btm.id, btex);
+        self.selection = Some((SelKind::Text, btm.id));
+        self.frame()?;
+        assert!(self.text_panel_rect().is_some(), "text panel shows for text selection");
+        assert!(!self.text_panel_hits.is_empty(), "text panel has buttons");
+        self.text_panel_action(TextPanelAction::Align(1));
+        assert_eq!(self.doc.data.texts.iter().find(|t| t.id == btm.id).unwrap().align, 1);
+        self.text_panel_action(TextPanelAction::Shape(2));
+        assert_eq!(self.doc.data.texts.iter().find(|t| t.id == btm.id).unwrap().shape, 2);
+        self.text_panel_action(TextPanelAction::Size(8.0));
+        assert!((self.doc.data.texts.iter().find(|t| t.id == btm.id).unwrap().size - 40.0).abs() < 0.01);
+        // clicking a text panel button must not deselect
+        let pr = self.text_panel_rect().unwrap();
+        assert!(self.ui_hit(pr.x() + 10, pr.y() + 10), "text panel counts as chrome");
+        // color editor channel set
+        self.color_edit = Some(ColorTarget::Swatch(0));
+        self.set_edit_channel(0, 11);
+        self.set_edit_channel(1, 22);
+        self.set_edit_channel(2, 33);
+        assert_eq!(self.doc.data.palette[0], [11, 22, 33]);
+        self.color_edit = Some(ColorTarget::Bg);
+        self.set_edit_channel(0, 200);
+        assert_eq!(self.doc.data.bg[0], 200);
+        self.color_edit = None;
+        self.frame()?;
         // still frame for the export visual
         if let Some(m) = self.doc.data.vectors.iter_mut().find(|v| v.id == vid) {
             m.anim = AnimKind::Still;
