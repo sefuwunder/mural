@@ -395,7 +395,7 @@ pub fn light_oil_region(
             let ridge = (slope * 6.0).clamp(0.0, 1.0);
             let gloss = ((hv - 90.0) / 110.0).clamp(0.0, 1.0);
             let ndoth = (nx * hx + ny * hy + nz * hz).max(0.0);
-            let spec = ndoth.powf(28.0) * gloss * ridge * 0.5;
+            let spec = ndoth.powf(28.0) * gloss * ridge * 0.2;
             for c in 0..3 {
                 let v = px[o + c] as f32 * diff + spec * 255.0;
                 px[o + c] = v.clamp(0.0, 255.0) as u8;
