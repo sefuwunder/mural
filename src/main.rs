@@ -9,7 +9,7 @@ mod palette;
 mod vector;
 
 use audio::{AudioClip, CLIP_RADIUS};
-use brush::{blit_stamp, box_blur_rgba, walk_segment, TipCache, Tool};
+use brush::{blit_stamp, box_blur_rgba, light_oil_region, stamp_height, walk_segment, TipCache, Tool};
 use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, ToolSer, VectorMeta};
 use doc::Doc;
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
@@ -450,7 +450,21 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             });
             let origin = (key.0 as f32 * TILE_PX, key.1 as f32 * TILE_PX);
             let trect = Rect::new(origin.0, origin.1, origin.0 + TILE_PX, origin.1 + TILE_PX);
-            // (tile-local rect, raw RGBA8888 pixels) to blur after rasterizing
+            // Paint-thickness heightmap for oil relief lighting. Rebuilt
+            // deterministically from the strokes on every pass (like the
+            // color tiles), so layering/undo/load can't drift it. Only
+            // allocated when oil strokes touch this tile.
+            let has_oil = doc
+                .data
+                .strokes
+                .iter()
+                .any(|s| s.tool == ToolSer::OilStick && s.bbox().intersects(&trect));
+            let mut height: Option<Vec<u8>> = if has_oil {
+                Some(vec![0u8; TILE_PX as usize * TILE_PX as usize])
+            } else {
+                None
+            };
+            // (tile-local rect, raw RGBA8888 pixels) to blur+light after rasterizing
             let mut blur_jobs: Vec<(SdlRect, Vec<u8>)> = Vec::new();
             canvas
                 .with_texture_canvas(tile, |c| {
@@ -468,7 +482,15 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                         if !b.intersects(&trect) {
                             continue;
                         }
-                        rasterize_stroke(c, tc, tips, s, origin, &doc.data.palette);
+                        rasterize_stroke(
+                            c,
+                            tc,
+                            tips,
+                            s,
+                            origin,
+                            &doc.data.palette,
+                            height.as_mut().map(|v| &mut v[..]),
+                        );
                         if s.tool == ToolSer::OilStick {
                             oil_rects.push(b);
                         }
@@ -503,7 +525,21 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             for (xr, px) in blur_jobs {
                 let w = xr.width() as usize;
                 let h = xr.height() as usize;
-                let blurred = box_blur_rgba(&px, w, h, OIL_BLUR_R);
+                let mut blurred = box_blur_rgba(&px, w, h, OIL_BLUR_R);
+                // relief lighting from the paint-thickness heightmap:
+                // ridges catch specular highlights, valleys shade, thin
+                // washes stay matte
+                if let Some(hgt) = height.as_ref() {
+                    light_oil_region(
+                        &mut blurred,
+                        hgt,
+                        TILE_PX as usize,
+                        xr.x() as usize,
+                        xr.y() as usize,
+                        w,
+                        h,
+                    );
+                }
                 let _ = tile.update(xr, &blurred, w * 4);
             }
         }
@@ -517,18 +553,27 @@ fn rasterize_stroke<'a>(
     s: &Stroke,
     origin: (f32, f32),
     pal: &[[u8; 3]; 16],
+    height: Option<&mut [u8]>, // tile-local paint-thickness map (TILE_PX^2); oil dabs deposit here
 ) {
     if s.points.is_empty() {
         return;
     }
     let tool = Tool::from(s.tool);
+    let is_oil = matches!(tool, Tool::OilStick);
     let d = s.size.max(2.0) as u32;
     let tip = tips.get(tc, tool, d).expect("tip");
     let p = pal[s.color % 16];
     let col = Color::RGB(p[0], p[1], p[2]);
     tip.set_color_mod(col.r, col.g, col.b);
-    let stamp = |c: &mut Canvas<Window>, x: f32, y: f32, dd: f32| {
+    let mut hbuf = height;
+    let tw = TILE_PX as usize;
+    let mut stamp = |c: &mut Canvas<Window>, x: f32, y: f32, dd: f32| {
         blit_stamp(c, tip, x - origin.0, y - origin.1, dd).expect("stamp");
+        if is_oil {
+            if let Some(h) = hbuf.as_mut() {
+                stamp_height(h, tw, x - origin.0, y - origin.1, dd);
+            }
+        }
     };
     if s.points.len() == 1 {
         let (x, y) = s.points[0];

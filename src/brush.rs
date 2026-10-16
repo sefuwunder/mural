@@ -90,6 +90,10 @@ pub fn make_tip<'a>(
                         } else {
                             a *= 0.94 + 0.06 * hash01(x as i32, y as i32, 100);
                         }
+                        // bristle striation: subtle directional grain so thin
+                        // edges read as dry-brush, like bristle marks on a
+                        // real oil stick (cf. reference swatch photos)
+                        a *= 0.88 + 0.12 * hash01((x as f32 / 2.0) as i32, y as i32, 101);
                     }
                 }
                 let o = ((y * d + x) * 4) as usize;
@@ -272,6 +276,134 @@ pub fn box_blur_rgba(px: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
     out
 }
 
+/// Deposit paint thickness into a tile-local u8 heightmap (saturating add).
+/// Uses the same soft radial body as the oil tip so accumulated height tracks
+/// deposited paint: overlapping dabs build relief, single passes stay thin.
+/// Deterministic — the heightmap is rebuilt from the strokes on every
+/// re-rasterize, exactly like the color tiles, so layering/undo can't drift.
+pub fn stamp_height(buf: &mut [u8], w: usize, x: f32, y: f32, diameter: f32) {
+    let d = diameter.max(1.0);
+    let r = d / 2.0;
+    let h = buf.len() / w.max(1);
+    let ri = r.ceil() as i32;
+    let cx = x.round() as i32;
+    let cy = y.round() as i32;
+    for oy in -ri..=ri {
+        let py = cy + oy;
+        if py < 0 || py >= h as i32 {
+            continue;
+        }
+        for ox in -ri..=ri {
+            let px = cx + ox;
+            if px < 0 || px >= w as i32 {
+                continue;
+            }
+            let dx = px as f32 + 0.5 - x;
+            let dy = py as f32 + 0.5 - y;
+            let dist = (dx * dx + dy * dy).sqrt() / r;
+            if dist >= 1.0 {
+                continue;
+            }
+            let body = (1.0 - dist.powf(2.2)).clamp(0.0, 1.0);
+            let add = (body.powf(1.35) * 64.0) as u8;
+            let i = py as usize * w + px as usize;
+            buf[i] = buf[i].saturating_add(add);
+        }
+    }
+}
+
+/// Thickness-dependent oil lighting, in place over an RGBA8888 region.
+/// Reads relief from a u8 heightmap: ridges catch a specular highlight and
+/// shade via the surface normal, valleys darken, thin washes (low height)
+/// stay matte — the way light behaves on real impasto vs thin paint.
+/// Light comes from the upper-left, matching the reference swatch photos.
+/// `px`: w*h*4 region bytes (straight alpha); `hgt`: full tile heightmap of
+/// width `tw`; `(rx, ry)`: region origin inside the tile. Deterministic.
+pub fn light_oil_region(
+    px: &mut [u8],
+    hgt: &[u8],
+    tw: usize,
+    rx: usize,
+    ry: usize,
+    w: usize,
+    h: usize,
+) {
+    assert_eq!(px.len(), w * h * 4);
+    if w == 0 || h == 0 || tw == 0 {
+        return;
+    }
+    let th = hgt.len() / tw;
+    if th == 0 {
+        return;
+    }
+    // light direction, toward the source (upper-left-front)
+    let (lx, ly, lz) = {
+        let (x, y, z) = (-0.45f32, -0.55f32, 0.70f32);
+        let l = (x * x + y * y + z * z).sqrt();
+        (x / l, y / l, z / l)
+    };
+    // Blinn-Phong half vector; viewer is straight above the canvas
+    let (hx, hy, hz) = {
+        let (x, y, z) = (lx, ly, lz + 1.0);
+        let l = (x * x + y * y + z * z).sqrt();
+        (x / l, y / l, z / l)
+    };
+    // relief exaggeration: height-units of slope per pixel
+    let hs = 0.055f32;
+    // smooth heights slightly (radius-1 box) so dab quantization
+    // doesn't band the normals
+    let mut sm = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0f32;
+            for dy in -1isize..=1 {
+                let sy = (ry + y).saturating_add_signed(dy).min(th - 1);
+                for dx in -1isize..=1 {
+                    let sx = (rx + x).saturating_add_signed(dx).min(tw - 1);
+                    acc += hgt[sy * tw + sx] as f32;
+                }
+            }
+            sm[y * w + x] = acc / 9.0;
+        }
+    }
+    let at = |x: isize, y: isize| -> f32 {
+        let x = x.clamp(0, w as isize - 1) as usize;
+        let y = y.clamp(0, h as isize - 1) as usize;
+        sm[y * w + x]
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let hv = sm[i];
+            if hv < 4.0 {
+                continue; // thin wash: matte, untouched
+            }
+            let o = i * 4;
+            if px[o + 3] < 8 {
+                continue; // (near-)transparent: nothing to shade
+            }
+            let dx = (at(x as isize + 1, y as isize) - at(x as isize - 1, y as isize)) * 0.5 * hs;
+            let dy = (at(x as isize, y as isize + 1) - at(x as isize, y as isize - 1)) * 0.5 * hs;
+            let nl = (dx * dx + dy * dy + 1.0).sqrt();
+            let (nx, ny, nz) = (-dx / nl, -dy / nl, 1.0 / nl);
+            let ndotl = (nx * lx + ny * ly + nz * lz).max(0.0);
+            // flat paint renders unchanged; slopes facing the light lift,
+            // slopes facing away sink
+            let diff = (1.0 + 0.32 * (ndotl - lz)).clamp(0.55, 1.4);
+            // gloss lives on ridges of thick paint only
+            let slope = (dx * dx + dy * dy).sqrt();
+            let ridge = (slope * 6.0).clamp(0.0, 1.0);
+            let gloss = ((hv - 90.0) / 110.0).clamp(0.0, 1.0);
+            let ndoth = (nx * hx + ny * hy + nz * hz).max(0.0);
+            let spec = ndoth.powf(28.0) * gloss * ridge * 0.5;
+            for c in 0..3 {
+                let v = px[o + c] as f32 * diff + spec * 255.0;
+                px[o + c] = v.clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +493,81 @@ mod tests {
             let out = box_blur_rgba(&px, w, h, 4);
             assert_eq!(out.len(), w * h * 4);
         }
+    }
+    #[test]
+    fn stamp_height_deposits_and_saturates() {
+        let mut buf = vec![0u8; 32 * 32];
+        stamp_height(&mut buf, 32, 16.0, 16.0, 20.0);
+        let c = buf[16 * 32 + 16];
+        assert!(c > 0, "dab center must gain height");
+        assert_eq!(buf[0], 0, "far corner untouched");
+        // overlapping dabs build relief but never wrap
+        for _ in 0..30 {
+            stamp_height(&mut buf, 32, 16.0, 16.0, 20.0);
+        }
+        assert_eq!(buf[16 * 32 + 16], 255, "height saturates, never wraps");
+        // off-tile dabs must not panic or write OOB
+        stamp_height(&mut buf, 32, -50.0, -50.0, 20.0);
+        stamp_height(&mut buf, 32, 500.0, 500.0, 20.0);
+    }
+    #[test]
+    fn light_oil_flat_height_is_identity() {
+        // thick but perfectly flat paint: no slopes, no gloss -> unchanged
+        let mut px = solid_rgba(16, 16, [120, 130, 140, 255]);
+        let hgt = vec![200u8; 16 * 16];
+        let before = px.clone();
+        light_oil_region(&mut px, &hgt, 16, 0, 0, 16, 16);
+        assert_eq!(px, before, "flat relief must render unchanged");
+    }
+    #[test]
+    fn light_oil_thin_wash_is_matte() {
+        // low height everywhere: skipped, matte
+        let mut px = solid_rgba(16, 16, [120, 130, 140, 255]);
+        let hgt = vec![3u8; 16 * 16];
+        let before = px.clone();
+        light_oil_region(&mut px, &hgt, 16, 0, 0, 16, 16);
+        assert_eq!(px, before, "thin wash must stay matte");
+        // transparent pixels are never shaded
+        let mut px2 = solid_rgba(16, 16, [120, 130, 140, 0]);
+        let hgt2 = vec![200u8; 16 * 16];
+        light_oil_region(&mut px2, &hgt2, 16, 0, 0, 16, 16);
+        assert_eq!(px2[3], 0);
+    }
+    #[test]
+    fn light_oil_ridge_shades_with_light_direction() {
+        // light comes from the upper-left (-x): a ramp rising toward +x
+        // faces the light (brighter + specular), a ramp rising toward -x
+        // faces away (darker).
+        let mk = || solid_rgba(32, 8, [100, 100, 100, 255]);
+        let mut toward = mk();
+        let mut hgt = vec![0u8; 32 * 8];
+        for y in 0..8 {
+            for x in 0..32 {
+                hgt[y * 32 + x] = (x as f32 * 8.0).min(255.0) as u8; // rises toward +x
+            }
+        }
+        light_oil_region(&mut toward, &hgt, 32, 0, 0, 32, 8);
+        let max_toward = toward.chunks(4).map(|p| p[0]).max().unwrap();
+        assert!(max_toward > 105, "light-facing ridge must lift, got {max_toward}");
+
+        let mut away = mk();
+        let mut hgt2 = vec![0u8; 32 * 8];
+        for y in 0..8 {
+            for x in 0..32 {
+                hgt2[y * 32 + x] = ((31 - x) as f32 * 8.0).min(255.0) as u8;
+            }
+        }
+        light_oil_region(&mut away, &hgt2, 32, 0, 0, 32, 8);
+        let min_away = away.chunks(4).map(|p| p[0]).min().unwrap();
+        assert!(min_away < 95, "shadow-facing slope must sink, got {min_away}");
+
+        // deterministic: same input -> same output
+        let mut again = mk();
+        light_oil_region(&mut again, &hgt, 32, 0, 0, 32, 8);
+        assert_eq!(toward, again);
+        // sub-region offsets index the tile heightmap correctly
+        let mut sub = solid_rgba(8, 8, [100, 100, 100, 255]);
+        light_oil_region(&mut sub, &hgt, 32, 4, 0, 8, 8);
+        assert_eq!(sub.len(), 8 * 8 * 4);
     }
 }
