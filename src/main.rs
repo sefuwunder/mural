@@ -180,10 +180,16 @@ struct App<'tc, 'ttf> {
 }
 
 fn tiles_in_rect(r: &Rect) -> Vec<(i32, i32)> {
+    // Clamp the tile range: a huge rect (e.g. from a programming slip) must
+    // never turn into a terabytes-large Vec and take the app down.
+    const MAX_TILES_PER_AXIS: i32 = 4000; // 4000^2 tiles x 512px = plenty
     let x0 = (r.x0 / TILE_PX).floor() as i32;
     let y0 = (r.y0 / TILE_PX).floor() as i32;
     let x1 = (r.x1 / TILE_PX).floor() as i32;
     let y1 = (r.y1 / TILE_PX).floor() as i32;
+    if x1 - x0 > MAX_TILES_PER_AXIS || y1 - y0 > MAX_TILES_PER_AXIS {
+        return vec![];
+    }
     let mut out = vec![];
     for ty in y0..=y1 {
         for tx in x0..=x1 {
@@ -1819,6 +1825,22 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         assert_eq!(self.doc.data.vectors.len(), nv0 - 1);
         self.doc.redo();
         assert_eq!(self.doc.data.vectors.len(), nv0);
+        // save/load roundtrip with the vector present (exercises load_data +
+        // sync_media; the following rerasterize() would previously try to
+        // allocate ~122TB of tile keys and crash)
+        let json = self.doc.to_json().expect("to_json");
+        let data = crate::doc::Doc::from_json(&json).expect("from_json");
+        let nv = data.vectors.len();
+        let ni = data.images.len();
+        let ns = data.strokes.len();
+        self.doc.load_data(crate::doc::DocData::default());
+        self.sync_media();
+        assert!(self.doc.data.vectors.is_empty());
+        self.doc.load_data(data);
+        self.sync_media();
+        assert_eq!(self.doc.data.vectors.len(), nv, "vectors survive roundtrip");
+        assert_eq!(self.doc.data.images.len(), ni, "images survive roundtrip");
+        assert_eq!(self.doc.data.strokes.len(), ns, "strokes survive roundtrip");
         // still frame for the export visual
         if let Some(m) = self.doc.data.vectors.iter_mut().find(|v| v.id == vid) {
             m.anim = AnimKind::Still;

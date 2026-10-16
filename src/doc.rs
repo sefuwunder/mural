@@ -371,8 +371,11 @@ impl Doc {
             + 1;
         self.undo.clear();
         self.redo.clear();
-        // everything needs rasterizing
-        self.dirty.push(Rect::new(-1e9, -1e9, 1e9, 1e9));
+        // Mark the actual content dirty. A giant/infinite rect here would make
+        // tiles_in_rect() try to allocate terabytes and crash the app.
+        if let Some(b) = self.content_bbox() {
+            self.dirty.push(b.expand(200.0));
+        }
     }
 
     pub fn content_bbox(&self) -> Option<Rect> {
@@ -458,5 +461,23 @@ mod tests {
         let data = Doc::from_json(&j).unwrap();
         assert_eq!(data.strokes.len(), 1);
         assert_eq!(data.strokes[0].id, 3);
+    }
+    #[test]
+    fn load_data_dirty_rect_is_bounded() {
+        // Regression: load_data used to push a (-1e9..1e9) dirty rect, which
+        // made tiles_in_rect() try to allocate ~122TB and crash the app on
+        // every Ctrl+O.
+        let mut d = Doc::new();
+        d.add_stroke(stroke(4));
+        let j = d.to_json().unwrap();
+        let data = Doc::from_json(&j).unwrap();
+        let mut d2 = Doc::new();
+        d2.load_data(data);
+        let dirty = d2.take_dirty();
+        assert!(!dirty.is_empty());
+        for r in &dirty {
+            assert!((r.x1 - r.x0) < 100000.0, "dirty rect too wide: {:?}", r.x1 - r.x0);
+            assert!((r.y1 - r.y0) < 100000.0, "dirty rect too tall: {:?}", r.y1 - r.y0);
+        }
     }
 }
