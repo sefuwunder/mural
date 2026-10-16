@@ -26,6 +26,22 @@ reference, and drop text labels anywhere. Pan forever, zoom 0.1x–8x.
 - Or drag & drop files/folders straight from your file manager
 - `V` tool: drag images freely, `del` removes
 
+## Vectors
+Select an image (V) and press **X** — or hit the **Vec** button — to trace it
+into resolution-independent vector polygons (via vtracer, B&W polygon mode;
+works best on high-contrast images). The vector lands exactly over the source
+image and starts playing a draw-on animation.
+
+With a vector selected, a panel appears above the bottom bar:
+
+- **Still / Draw / Wave / Spin / Pulse / March** — animation mode
+  (March = marching-ants dashed outline)
+- **play/pause**, **speed** slider (0.25×–3×), **Fill** toggle
+- clicking a palette swatch recolors the vector
+
+Vectors sit between the paint and text layers, can be moved with V,
+deleted, undone/redone, saved in `mural.json`, and exported to PNG.
+
 ## Text
 
 - `T` → click anywhere → type → Enter commits
@@ -40,6 +56,7 @@ reference, and drop text labels anywhere. Pan forever, zoom 0.1x–8x.
 | T | text |
 | `[` `]` | brush size |
 | I | import folder |
+| X | vectorize selected image |
 | del | delete selected |
 | esc | deselect / cancel |
 | ctrl+Z / ctrl+Y | undo / redo |
