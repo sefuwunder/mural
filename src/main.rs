@@ -10,7 +10,7 @@ mod vector;
 
 use audio::{AudioClip, CLIP_RADIUS};
 use brush::{blit_stamp, box_blur_rgba, walk_segment, TipCache, Tool};
-use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, VectorMeta};
+use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, ToolSer, VectorMeta};
 use doc::Doc;
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
 use palette::{COUNT as PALETTE_COUNT, COLOR_SETS, PAPER_DOT};
@@ -429,10 +429,6 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         if dirty.is_empty() {
             return;
         }
-        // Oil-stroke regions that want the grease blur after rasterizing.
-        // Bounded to these rects only — never whole tiles. Overlapping
-        // entries are unioned so no region blurs twice in one pass.
-        let oil_dirty = union_rects(self.doc.take_oil_dirty());
         let mut keys = HashSet::new();
         for r in &dirty {
             for k in tiles_in_rect(&r.expand(160.0)) {
@@ -460,14 +456,25 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 .with_texture_canvas(tile, |c| {
                     c.set_draw_color(Color::RGBA(0, 0, 0, 0));
                     c.clear();
+                    // grease: melt oil-stroke edges into the canvas.
+                    // Deterministic — EVERY re-rasterize blurs ALL oil strokes
+                    // on the tile. (The old design blurred only newly-drawn
+                    // regions, but tiles redraw from scratch, so layering a new
+                    // stroke silently un-blurred older ones, leaving shifting
+                    // rectangular sharp/blurry patches.)
+                    let mut oil_rects: Vec<Rect> = Vec::new();
                     for s in &doc.data.strokes {
-                        if !s.bbox().intersects(&trect) {
+                        let b = s.bbox();
+                        if !b.intersects(&trect) {
                             continue;
                         }
                         rasterize_stroke(c, tc, tips, s, origin, &doc.data.palette);
+                        if s.tool == ToolSer::OilStick {
+                            oil_rects.push(b);
+                        }
                     }
                     // grease: melt freshly rasterized oil edges into the canvas
-                    for r in &oil_dirty {
+                    for r in &union_rects(oil_rects) {
                         if !r.intersects(&trect) {
                             continue;
                         }

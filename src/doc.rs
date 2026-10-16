@@ -2,7 +2,7 @@
 //! Pure data (no SDL) except via canvas types.
 
 use crate::audio::AudioClip;
-use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta, VectorMeta, ToolSer};
+use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta, VectorMeta};
 use crate::palette::COLOR_SETS;
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +58,6 @@ pub struct Doc {
     undo: Vec<Action>,
     redo: Vec<Action>,
     dirty: Vec<Rect>,     // paint-tile regions needing re-rasterization
-    oil_dirty: Vec<Rect>, // oil-stroke regions needing the grease blur (subset of dirty)
 }
 
 impl Doc {
@@ -74,7 +73,6 @@ impl Doc {
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: Vec::new(),
-            oil_dirty: Vec::new(),
         }
     }
     pub fn alloc_id(&mut self) -> u64 {
@@ -87,18 +85,8 @@ impl Doc {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Regions of freshly rasterized oil strokes that want the grease blur.
-    /// Drained by the app's re-raster pass; bounded to these rects only.
-    pub fn take_oil_dirty(&mut self) -> Vec<Rect> {
-        std::mem::take(&mut self.oil_dirty)
-    }
-
     fn mark_stroke_dirty(&mut self, s: &Stroke) {
-        let b = s.bbox();
-        self.dirty.push(b);
-        if s.tool == ToolSer::OilStick {
-            self.oil_dirty.push(b);
-        }
+        self.dirty.push(s.bbox());
     }
 
     /// Load a color set's 16 colors into the runtime palette (existing
@@ -486,12 +474,6 @@ impl Doc {
         if let Some(b) = self.content_bbox() {
             self.dirty.push(b.expand(200.0));
         }
-        // Loaded oil strokes get the grease blur on their first raster too.
-        for s in &self.data.strokes {
-            if s.tool == ToolSer::OilStick {
-                self.oil_dirty.push(s.bbox());
-            }
-        }
     }
 
     pub fn content_bbox(&self) -> Option<Rect> {
@@ -616,31 +598,33 @@ mod tests {
         assert_eq!(legacy.palette, COLOR_SETS[0].colors);
     }
     #[test]
-    fn oil_dirty_tracks_oil_strokes_only() {
+    fn oil_blur_needs_no_tracking_state() {
+        // Regression: the old oil_dirty tracking blurred only newly-drawn
+        // regions, but tiles redraw from scratch — so layering a new oil
+        // stroke silently un-blurred older ones (rectangular patch artifacts).
+        // The blur is now derived deterministically from the strokes
+        // themselves on every re-rasterize, so no tracking state exists.
         let mut d = Doc::new();
         d.add_stroke(stroke(1)); // pen
-        assert!(d.take_oil_dirty().is_empty(), "pen must not mark oil_dirty");
         d.add_stroke(oil_stroke(2));
-        let od = d.take_oil_dirty();
-        assert_eq!(od.len(), 1, "oil stroke must mark oil_dirty");
-        assert!(od[0].x1 > 30.0, "oil dirty rect must cover the stroke");
-        // delete + undo/redo also track
         d.delete_stroke(2);
-        assert_eq!(d.take_oil_dirty().len(), 1);
-        d.undo();
-        assert_eq!(d.take_oil_dirty().len(), 1);
-        d.redo();
-        assert_eq!(d.take_oil_dirty().len(), 1);
+        d.undo(); // restores the oil stroke
+        // oil strokes remain identifiable by tool type; dirty regions still marked
+        let oils: Vec<_> = d.data.strokes.iter().filter(|s| s.tool == ToolSer::OilStick).collect();
+        assert_eq!(oils.len(), 1);
+        d.redo(); // re-applies the delete
+        assert!(d.data.strokes.iter().all(|s| s.tool != ToolSer::OilStick));
+        assert!(!d.take_dirty().is_empty());
     }
     #[test]
-    fn load_data_marks_oil_dirty() {
+    fn load_data_marks_content_dirty() {
         let mut d = Doc::new();
         d.add_stroke(oil_stroke(7));
         let j = d.to_json().unwrap();
         let data = Doc::from_json(&j).unwrap();
         let mut d2 = Doc::new();
         d2.load_data(data);
-        assert_eq!(d2.take_oil_dirty().len(), 1, "loaded oil strokes blur on first raster");
+        assert!(!d2.take_dirty().is_empty(), "loaded content must re-rasterize (oil blur included)");
     }
     #[test]
     fn undo_redo_stroke() {
