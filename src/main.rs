@@ -177,17 +177,19 @@ struct App<'tc, 'ttf> {
     last_click_item: Option<(SelKind, u64)>,
     win_w: u32,
     win_h: u32,
+    current_path: Option<std::path::PathBuf>,
 }
 
 fn tiles_in_rect(r: &Rect) -> Vec<(i32, i32)> {
     // Clamp the tile range: a huge rect (e.g. from a programming slip) must
     // never turn into a terabytes-large Vec and take the app down.
-    const MAX_TILES_PER_AXIS: i32 = 4000; // 4000^2 tiles x 512px = plenty
+    // (i64 diff: an i32 subtraction could itself overflow on absurd ranges.)
+    const MAX_TILES_PER_AXIS: i64 = 4000; // 4000^2 tiles x 512px = plenty
     let x0 = (r.x0 / TILE_PX).floor() as i32;
     let y0 = (r.y0 / TILE_PX).floor() as i32;
     let x1 = (r.x1 / TILE_PX).floor() as i32;
     let y1 = (r.y1 / TILE_PX).floor() as i32;
-    if x1 - x0 > MAX_TILES_PER_AXIS || y1 - y0 > MAX_TILES_PER_AXIS {
+    if x1 as i64 - x0 as i64 > MAX_TILES_PER_AXIS || y1 as i64 - y0 as i64 > MAX_TILES_PER_AXIS {
         return vec![];
     }
     let mut out = vec![];
@@ -264,6 +266,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             import_buf: None,
             show_help: false,
             toast: None,
+            current_path: None,
             start: Instant::now(),
             last_click_at: None,
             last_click_item: None,
@@ -1589,9 +1592,16 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn save_doc(&mut self) {
+        let path = self
+            .current_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("mural.json"));
         match self.doc.to_json() {
-            Ok(j) => match std::fs::write("mural.json", j) {
-                Ok(_) => self.toast("saved mural.json"),
+            Ok(j) => match std::fs::write(&path, j) {
+                Ok(_) => {
+                    self.current_path = Some(path.clone());
+                    self.toast(&format!("saved {}", path.display()));
+                }
                 Err(e) => self.toast(&format!("save failed: {}", e)),
             },
             Err(e) => self.toast(&format!("save failed: {}", e)),
@@ -1599,7 +1609,19 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn load_doc(&mut self) {
-        let s = match std::fs::read_to_string("mural.json") {
+        let path = rfd::FileDialog::new()
+            .add_filter("mural", &["json"])
+            .set_title("Open mural")
+            .pick_file();
+        let path = match path {
+            Some(p) => p,
+            None => return, // cancelled (or no dialog backend available)
+        };
+        self.load_path(&path);
+    }
+
+    fn load_path(&mut self, path: &std::path::Path) {
+        let s = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
                 self.toast(&format!("open failed: {}", e));
@@ -1616,9 +1638,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.sync_media();
                 let missing = n_img - self.img_tex.len();
                 self.selection = None;
+                self.current_path = Some(path.to_path_buf());
                 self.toast(&format!(
-                    "loaded mural.json{}{}",
-                    "",
+                    "loaded {}{}",
+                    path.display(),
                     if missing > 0 { format!(" ({} images missing)", missing) } else { String::new() }
                 ));
             }
@@ -1886,6 +1909,16 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "wave click must set the anim mode"
         );
         assert_eq!(self.selection, Some((SelKind::Vector, vid)), "panel click must not deselect");
+        // real file-based load_doc with hostile data: old-format JSON (no
+        // vectors key), a text, and an image whose file is missing
+        let hostile = r#"{"strokes":[{"id":1,"tool":"Pen","color":0,"size":4.0,"points":[[0.0,0.0],[100.0,50.0]]}],"images":[{"id":2,"path":"/tmp/does_not_exist.png","x":10.0,"y":10.0,"w":200.0,"h":100.0}],"texts":[{"id":3,"text":"hello","x":5.0,"y":5.0,"w":60.0,"h":20.0,"color":1,"size":24.0}]}"#;
+        std::fs::write("mural.json", hostile).expect("write mural.json");
+        self.load_path(std::path::Path::new("mural.json"));
+        assert_eq!(self.doc.data.strokes.len(), 1, "strokes load");
+        assert_eq!(self.doc.data.texts.len(), 1, "texts load");
+        assert!(self.img_tex.is_empty(), "missing image must not load a texture");
+        self.frame()?;
+        std::fs::remove_file("mural.json").ok();
         // still frame for the export visual
         if let Some(m) = self.doc.data.vectors.iter_mut().find(|v| v.id == vid) {
             m.anim = AnimKind::Still;

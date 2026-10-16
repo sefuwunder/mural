@@ -5,6 +5,7 @@ edition = "2021"
 description = "Infinite canvas drawing app for desktop: marker/pencil/pen/oil stick, 16 colors, image import, text"
 
 [dependencies]
+rfd = "0.17"
 sdl2 = { version = "0.37", features = ["ttf"] }
 image = "0.25"
 serde = { version = "1.0", features = ["derive"] }
