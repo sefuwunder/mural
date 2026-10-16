@@ -270,6 +270,27 @@ impl VectorMeta {
     }
 }
 
+/// Merge overlapping rects into their unions, so a region blurred once per
+/// pass never gets double-blurred when several dirty entries cover it
+/// (e.g. add + undo + redo of the same oil stroke).
+pub fn union_rects(rs: Vec<Rect>) -> Vec<Rect> {
+    let mut out: Vec<Rect> = Vec::new();
+    for r in rs {
+        let mut cur = r;
+        let mut i = 0;
+        while i < out.len() {
+            if out[i].intersects(&cur) {
+                let m = out.remove(i);
+                cur = cur.union(&m);
+            } else {
+                i += 1;
+            }
+        }
+        out.push(cur);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +312,18 @@ mod tests {
         let (wx2, wy2) = c.screen_to_world(600.0, 400.0, 800.0, 600.0);
         assert!((wx - wx2).abs() < 0.01 && (wy - wy2).abs() < 0.01);
         assert!((c.zoom - 2.0).abs() < 0.001);
+    }
+    #[test]
+    fn union_rects_merges_overlap() {
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let b = Rect::new(5.0, 5.0, 15.0, 15.0);
+        let c = Rect::new(100.0, 100.0, 110.0, 110.0);
+        let out = union_rects(vec![a, b, c, a]);
+        assert_eq!(out.len(), 2, "overlapping+duplicate rects must merge");
+        let m = out.iter().find(|r| r.x0 == 0.0).unwrap();
+        assert_eq!((m.x1, m.y1), (15.0, 15.0));
+        assert!(out.iter().any(|r| r.x0 == 100.0));
+        assert!(union_rects(vec![]).is_empty());
     }
     #[test]
     fn zoom_clamped() {

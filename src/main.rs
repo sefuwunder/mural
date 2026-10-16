@@ -9,11 +9,11 @@ mod palette;
 mod vector;
 
 use audio::{AudioClip, CLIP_RADIUS};
-use brush::{blit_stamp, walk_segment, TipCache, Tool};
-use canvas::{AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, VectorMeta};
+use brush::{blit_stamp, box_blur_rgba, walk_segment, TipCache, Tool};
+use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, VectorMeta};
 use doc::Doc;
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
-use palette::{COUNT as PALETTE_COUNT, PALETTE, PAPER_DOT};
+use palette::{COUNT as PALETTE_COUNT, COLOR_SETS, PAPER_DOT};
 use sdl2::audio::{AudioCallback, AudioDevice, AudioQueue, AudioSpecDesired};
 use sdl2::AudioSubsystem;
 use sdl2::event::Event;
@@ -31,6 +31,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const TILE_PX: f32 = 512.0;
+/// Oil-stick grease blur radius (kernel = 2r+1 = 5px), applied only to
+/// freshly rasterized oil-stroke dirty rects — never whole tiles.
+const OIL_BLUR_R: usize = 2;
 const TOP_H: i32 = 44;
 const TOOL_W: i32 = 60;
 const BOT_H: i32 = 76;
@@ -426,6 +429,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         if dirty.is_empty() {
             return;
         }
+        // Oil-stroke regions that want the grease blur after rasterizing.
+        // Bounded to these rects only — never whole tiles. Overlapping
+        // entries are unioned so no region blurs twice in one pass.
+        let oil_dirty = union_rects(self.doc.take_oil_dirty());
         let mut keys = HashSet::new();
         for r in &dirty {
             for k in tiles_in_rect(&r.expand(160.0)) {
@@ -447,6 +454,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             });
             let origin = (key.0 as f32 * TILE_PX, key.1 as f32 * TILE_PX);
             let trect = Rect::new(origin.0, origin.1, origin.0 + TILE_PX, origin.1 + TILE_PX);
+            // (tile-local rect, raw RGBA8888 pixels) to blur after rasterizing
+            let mut blur_jobs: Vec<(SdlRect, Vec<u8>)> = Vec::new();
             canvas
                 .with_texture_canvas(tile, |c| {
                     c.set_draw_color(Color::RGBA(0, 0, 0, 0));
@@ -457,8 +466,39 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                         }
                         rasterize_stroke(c, tc, tips, s, origin, &doc.data.palette);
                     }
+                    // grease: melt freshly rasterized oil edges into the canvas
+                    for r in &oil_dirty {
+                        if !r.intersects(&trect) {
+                            continue;
+                        }
+                        // intersect, expand for blur context, clamp to the tile
+                        let ix0 = r.x0.max(trect.x0) - origin.0;
+                        let iy0 = r.y0.max(trect.y0) - origin.1;
+                        let ix1 = r.x1.min(trect.x1) - origin.0;
+                        let iy1 = r.y1.min(trect.y1) - origin.1;
+                        let x0 = (ix0 - OIL_BLUR_R as f32).max(0.0) as i32;
+                        let y0 = (iy0 - OIL_BLUR_R as f32).max(0.0) as i32;
+                        let x1 = (ix1 + OIL_BLUR_R as f32).min(TILE_PX) as i32;
+                        let y1 = (iy1 + OIL_BLUR_R as f32).min(TILE_PX) as i32;
+                        if x1 <= x0 || y1 <= y0 {
+                            continue;
+                        }
+                        let xr = SdlRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32);
+                        // readback failures are non-fatal: skip the blur
+                        if let Ok(px) = c.read_pixels(xr, PixelFormatEnum::RGBA8888) {
+                            if px.len() == (xr.width() * xr.height() * 4) as usize {
+                                blur_jobs.push((xr, px));
+                            }
+                        }
+                    }
                 })
                 .expect("rasterize");
+            for (xr, px) in blur_jobs {
+                let w = xr.width() as usize;
+                let h = xr.height() as usize;
+                let blurred = box_blur_rgba(&px, w, h, OIL_BLUR_R);
+                let _ = tile.update(xr, &blurred, w * 4);
+            }
         }
     }
 }
@@ -600,6 +640,28 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             40,
         )
     }
+    /// Chip showing the active color set; click = next set, right-click = prev.
+    fn set_chip_rect(&self) -> SdlRect {
+        SdlRect::new(
+            TOOL_W + 12 + 16 * 46 + 14,
+            self.win_h as i32 - 62,
+            132,
+            40,
+        )
+    }
+    fn set_name(&self) -> &'static str {
+        COLOR_SETS[self.doc.data.color_set % COLOR_SETS.len()].name
+    }
+    fn swatch_name(&self, i: usize) -> &'static str {
+        COLOR_SETS[self.doc.data.color_set % COLOR_SETS.len()].names[i % PALETTE_COUNT]
+    }
+    fn cycle_color_set(&mut self, dir: i32) {
+        let n = COLOR_SETS.len() as i32;
+        let cur = self.doc.data.color_set as i32;
+        let next = ((cur + dir) % n + n) % n;
+        self.doc.apply_color_set(next as usize);
+        self.toast(&format!("color set: {}", self.set_name()));
+    }
     fn slider_rect(&self) -> SdlRect {
         SdlRect::new(self.win_w as i32 - 300, self.win_h as i32 - 56, 220, 28)
     }
@@ -665,7 +727,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn on_down(&mut self, sx: i32, sy: i32, btn: MouseButton, video: &sdl2::VideoSubsystem) {
-        // right-click on a swatch / bg swatch opens the color editor
+        // right-click on a swatch / bg swatch opens the color editor;
+        // right-click on the set chip cycles to the previous color set
         if btn == MouseButton::Right {
             for i in 0..PALETTE_COUNT {
                 if self.swatch_rect(i).contains_point((sx, sy)) {
@@ -675,6 +738,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             }
             if self.bg_rect().contains_point((sx, sy)) {
                 self.color_edit = Some(ColorTarget::Bg);
+                return;
+            }
+            if self.set_chip_rect().contains_point((sx, sy)) {
+                self.cycle_color_set(-1);
                 return;
             }
         }
@@ -1004,6 +1071,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             }
             Some(Keycode::X) if !ctrl => self.vectorize_selection(),
             Some(Keycode::A) if !ctrl => self.toggle_record(),
+            Some(Keycode::C) if !ctrl => self.cycle_color_set(if shift { -1 } else { 1 }),
             Some(Keycode::LeftBracket) => self.set_brush_size(self.brush_size() / 1.25),
             Some(Keycode::RightBracket) => self.set_brush_size(self.brush_size() * 1.25),
             Some(Keycode::Z) if ctrl && !shift => self.do_undo(),
@@ -2001,7 +2069,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.canvas.set_draw_color(INK);
         self.canvas.draw_rect(pr)?;
         let title = match target {
-            ColorTarget::Swatch(i) => format!("swatch: {}", PALETTE[i % PALETTE_COUNT].name),
+            ColorTarget::Swatch(i) => format!("swatch: {}", self.swatch_name(i)),
             ColorTarget::Bg => "canvas background".to_string(),
         };
         self.draw_label(&title, INK, pr.x() + 14, pr.y() + 10)?;
@@ -2285,8 +2353,15 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.canvas.draw_rect(r2)?;
             }
         }
-        let cname = PALETTE[self.color_idx].name;
-        self.draw_label(cname, DIM, TOOL_W + 12, h - 20)?;
+        // color-set chip: click = next set, right-click / shift+C = previous
+        let cr = self.set_chip_rect();
+        self.cc(CHROME2);
+        self.canvas.fill_rect(cr)?;
+        self.cc(DIM);
+        self.canvas.draw_rect(cr)?;
+        self.draw_label(self.set_name(), INK, cr.x() + 10, cr.y() + 12)?;
+        let cname = self.swatch_name(self.color_idx);
+        self.draw_label(&format!("{} · {}", self.set_name(), cname), DIM, TOOL_W + 12, h - 20)?;
         // brush slider
         let sr = self.slider_rect();
         self.cc(CHROME2);
@@ -2310,6 +2385,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.set_tool(*t);
                 return;
             }
+        }
+        // color-set chip: click = next set
+        if self.set_chip_rect().contains_point((sx, sy)) {
+            self.cycle_color_set(1);
+            return;
         }
         // palette
         for i in 0..PALETTE_COUNT {
@@ -2406,7 +2486,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn draw_help(&mut self) -> Result<(), String> {
         let (w, h) = (self.win_w as i32, self.win_h as i32);
         let bw = 480;
-        let bh = 540;
+        let bh = 600;
         let bx = (w - bw) / 2;
         let by = (h - bh) / 2;
         self.canvas.set_draw_color(Color::RGBA(10, 10, 14, 230));
@@ -2426,6 +2506,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "A record voice clip (12kHz μ-law 96kbps); A again = stop, esc = cancel",
             "V + click a clip to select; double-click or space = play; del removes",
             "right-click a color swatch to edit it; BG edits canvas",
+            "C cycles color set (Studio/Dutch/Pop/Picasso/Basquiat); shift+C = back",
             "del remove selected   esc deselect",
             "ctrl+Z / ctrl+Y undo / redo",
             "ctrl+S save   ctrl+O open (file dialog)",

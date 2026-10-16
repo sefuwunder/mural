@@ -79,11 +79,16 @@ pub fn make_tip<'a>(
                         a = (1.0 - dist.powf(1.6)).clamp(0.0, 1.0).powf(0.8) * 0.42;
                     }
                     Tool::OilStick => {
-                        // impasto pits
-                        if hash01(x as i32, y as i32, 99) < 0.16 {
-                            a *= 0.42;
+                        // greasy impasto: soft buttery radial falloff with a
+                        // wet, lower-alpha center so overlapping dabs blend
+                        // wet-on-wet instead of fully covering; pits keep the
+                        // impasto character so it never reads as airbrushed.
+                        let body = (1.0 - dist.powf(2.2)).clamp(0.0, 1.0);
+                        a = body.powf(1.35) * 0.82;
+                        if hash01(x as i32, y as i32, 99) < 0.14 {
+                            a *= 0.55; // pits
                         } else {
-                            a *= 0.92 + 0.08 * hash01(x as i32, y as i32, 100);
+                            a *= 0.94 + 0.06 * hash01(x as i32, y as i32, 100);
                         }
                     }
                 }
@@ -167,6 +172,106 @@ pub fn blit_stamp(
     canvas.copy(tip, None, dst).map_err(|e| e.to_string())
 }
 
+/// Separable box blur over RGBA8888 bytes (R,G,B,A memory order), used to
+/// melt oil-stroke edges into the canvas. `radius` r gives a (2r+1) kernel.
+/// Premultiplied-alpha correct so soft edges don't grow dark halos.
+/// Pure CPU; callers must keep the region small (a stroke's dirty rect).
+pub fn box_blur_rgba(px: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+    assert_eq!(px.len(), w * h * 4);
+    if radius == 0 || w == 0 || h == 0 {
+        return px.to_vec();
+    }
+    let n = w * h;
+    // premultiply into f32 planes
+    let mut pr = vec![0.0f32; n];
+    let mut pg = vec![0.0f32; n];
+    let mut pb = vec![0.0f32; n];
+    let mut pa = vec![0.0f32; n];
+    for i in 0..n {
+        let a = px[i * 4 + 3] as f32 / 255.0;
+        pa[i] = a;
+        pr[i] = px[i * 4] as f32 / 255.0 * a;
+        pg[i] = px[i * 4 + 1] as f32 / 255.0 * a;
+        pb[i] = px[i * 4 + 2] as f32 / 255.0 * a;
+    }
+    let mut tr = vec![0.0f32; n];
+    let mut tg = vec![0.0f32; n];
+    let mut tb = vec![0.0f32; n];
+    let mut ta = vec![0.0f32; n];
+    let k = 2 * radius + 1;
+    let kinv = 1.0 / k as f32;
+    // horizontal pass, clamp-to-edge, sliding window
+    for y in 0..h {
+        let row = y * w;
+        let (sr, sg, sb, sa) = (&pr, &pg, &pb, &pa);
+        let (dr, dg, db, da) = (&mut tr, &mut tg, &mut tb, &mut ta);
+        let mut acc_r = 0.0f32;
+        let mut acc_g = 0.0f32;
+        let mut acc_b = 0.0f32;
+        let mut acc_a = 0.0f32;
+        for dx in -(radius as isize)..=(radius as isize) {
+            let x = dx.clamp(0, w as isize - 1) as usize;
+            acc_r += sr[row + x];
+            acc_g += sg[row + x];
+            acc_b += sb[row + x];
+            acc_a += sa[row + x];
+        }
+        for x in 0..w {
+            dr[row + x] = acc_r * kinv;
+            dg[row + x] = acc_g * kinv;
+            db[row + x] = acc_b * kinv;
+            da[row + x] = acc_a * kinv;
+            let x_out = (x as isize - radius as isize).clamp(0, w as isize - 1) as usize;
+            let x_in = (x as isize + radius as isize + 1).clamp(0, w as isize - 1) as usize;
+            acc_r += sr[row + x_in] - sr[row + x_out];
+            acc_g += sg[row + x_in] - sg[row + x_out];
+            acc_b += sb[row + x_in] - sb[row + x_out];
+            acc_a += sa[row + x_in] - sa[row + x_out];
+        }
+    }
+    // vertical pass into fresh buffers, then un-premultiply
+    let mut or_ = vec![0.0f32; n];
+    let mut og = vec![0.0f32; n];
+    let mut ob = vec![0.0f32; n];
+    let mut oa = vec![0.0f32; n];
+    for x in 0..w {
+        let mut acc_r = 0.0f32;
+        let mut acc_g = 0.0f32;
+        let mut acc_b = 0.0f32;
+        let mut acc_a = 0.0f32;
+        for dy in -(radius as isize)..=(radius as isize) {
+            let y = dy.clamp(0, h as isize - 1) as usize;
+            acc_r += tr[y * w + x];
+            acc_g += tg[y * w + x];
+            acc_b += tb[y * w + x];
+            acc_a += ta[y * w + x];
+        }
+        for y in 0..h {
+            or_[y * w + x] = acc_r * kinv;
+            og[y * w + x] = acc_g * kinv;
+            ob[y * w + x] = acc_b * kinv;
+            oa[y * w + x] = acc_a * kinv;
+            let y_out = (y as isize - radius as isize).clamp(0, h as isize - 1) as usize;
+            let y_in = (y as isize + radius as isize + 1).clamp(0, h as isize - 1) as usize;
+            acc_r += tr[y_in * w + x] - tr[y_out * w + x];
+            acc_g += tg[y_in * w + x] - tg[y_out * w + x];
+            acc_b += tb[y_in * w + x] - tb[y_out * w + x];
+            acc_a += ta[y_in * w + x] - ta[y_out * w + x];
+        }
+    }
+    let mut out = vec![0u8; n * 4];
+    for i in 0..n {
+        let a = oa[i].clamp(0.0, 1.0);
+        out[i * 4 + 3] = (a * 255.0).round() as u8;
+        if a > 1e-6 {
+            out[i * 4] = (or_[i] / a).clamp(0.0, 1.0).mul_add(255.0, 0.5) as u8;
+            out[i * 4 + 1] = (og[i] / a).clamp(0.0, 1.0).mul_add(255.0, 0.5) as u8;
+            out[i * 4 + 2] = (ob[i] / a).clamp(0.0, 1.0).mul_add(255.0, 0.5) as u8;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +300,66 @@ mod tests {
     fn hash_deterministic() {
         assert_eq!(hash01(3, 7, 99), hash01(3, 7, 99));
         assert!(hash01(0, 0, 0) >= 0.0 && hash01(0, 0, 0) < 1.0);
+    }
+    fn solid_rgba(w: usize, h: usize, px: [u8; 4]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(w * h * 4);
+        for _ in 0..w * h {
+            v.extend_from_slice(&px);
+        }
+        v
+    }
+    #[test]
+    fn blur_uniform_is_identity() {
+        // a uniform field must survive the blur unchanged (no halos, no drift)
+        let px = solid_rgba(24, 18, [200, 100, 50, 255]);
+        let out = box_blur_rgba(&px, 24, 18, 2);
+        assert_eq!(out.len(), px.len());
+        for (a, b) in px.iter().zip(out.iter()) {
+            assert!(((*a as i16) - (*b as i16)).abs() <= 1, "uniform blur drifted");
+        }
+        // transparent field stays transparent
+        let px = solid_rgba(10, 10, [0, 0, 0, 0]);
+        let out = box_blur_rgba(&px, 10, 10, 3);
+        assert!(out.iter().all(|&b| b == 0));
+    }
+    #[test]
+    fn blur_spreads_soft_edge_without_dark_halo() {
+        // opaque white disc on transparent bg: blur must soften the edge
+        // (mid alpha appears) but never invent dark RGB halos
+        let (w, h) = (32, 32);
+        let mut px = solid_rgba(w, h, [0, 0, 0, 0]);
+        for y in 10..22 {
+            for x in 10..22 {
+                let o = (y * w + x) * 4;
+                px[o] = 255;
+                px[o + 1] = 255;
+                px[o + 2] = 255;
+                px[o + 3] = 255;
+            }
+        }
+        let out = box_blur_rgba(&px, w, h, 2);
+        // center stays fully opaque white
+        let c = (16 * w + 16) * 4;
+        assert_eq!(out[c + 3], 255);
+        assert!(out[c] > 250 && out[c + 1] > 250 && out[c + 2] > 250);
+        // just outside the disc: partial alpha, still white (no dark halo)
+        let e = (8 * w + 16) * 4;
+        assert!(out[e + 3] > 0 && out[e + 3] < 255, "edge should be softened");
+        assert!(out[e] > 200 && out[e + 1] > 200 && out[e + 2] > 200, "no dark halo");
+        // far corner untouched
+        let f = (1 * w + 1) * 4;
+        assert_eq!(out[f + 3], 0);
+        // radius 0 is a no-op copy
+        let same = box_blur_rgba(&px, w, h, 0);
+        assert_eq!(same, px);
+    }
+    #[test]
+    fn blur_stays_in_bounds() {
+        // 1px-wide regions and tiny images must not panic or write OOB
+        for (w, h) in [(1, 1), (3, 1), (1, 7), (5, 5)] {
+            let px = solid_rgba(w, h, [10, 20, 30, 40]);
+            let out = box_blur_rgba(&px, w, h, 4);
+            assert_eq!(out.len(), w * h * 4);
+        }
     }
 }

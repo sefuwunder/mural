@@ -2,7 +2,8 @@
 //! Pure data (no SDL) except via canvas types.
 
 use crate::audio::AudioClip;
-use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta, VectorMeta};
+use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta, VectorMeta, ToolSer};
+use crate::palette::COLOR_SETS;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
@@ -36,6 +37,10 @@ pub struct DocData {
     pub bg: [u8; 3],
     #[serde(default = "default_palette")]
     pub palette: [[u8; 3]; 16],
+    /// Active interchangeable color set (index into palette::COLOR_SETS).
+    /// Legacy files without this field load as 0 ("Studio").
+    #[serde(default)]
+    pub color_set: usize,
 }
 
 pub fn default_bg() -> [u8; 3] {
@@ -52,7 +57,8 @@ pub struct Doc {
     next_id: u64,
     undo: Vec<Action>,
     redo: Vec<Action>,
-    dirty: Vec<Rect>, // paint-tile regions needing re-rasterization
+    dirty: Vec<Rect>,     // paint-tile regions needing re-rasterization
+    oil_dirty: Vec<Rect>, // oil-stroke regions needing the grease blur (subset of dirty)
 }
 
 impl Doc {
@@ -68,6 +74,7 @@ impl Doc {
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: Vec::new(),
+            oil_dirty: Vec::new(),
         }
     }
     pub fn alloc_id(&mut self) -> u64 {
@@ -79,6 +86,29 @@ impl Doc {
     pub fn take_dirty(&mut self) -> Vec<Rect> {
         std::mem::take(&mut self.dirty)
     }
+
+    /// Regions of freshly rasterized oil strokes that want the grease blur.
+    /// Drained by the app's re-raster pass; bounded to these rects only.
+    pub fn take_oil_dirty(&mut self) -> Vec<Rect> {
+        std::mem::take(&mut self.oil_dirty)
+    }
+
+    fn mark_stroke_dirty(&mut self, s: &Stroke) {
+        let b = s.bbox();
+        self.dirty.push(b);
+        if s.tool == ToolSer::OilStick {
+            self.oil_dirty.push(b);
+        }
+    }
+
+    /// Load a color set's 16 colors into the runtime palette (existing
+    /// strokes recolor by index, same as the swatch editor). Persists via
+    /// `DocData.color_set`.
+    pub fn apply_color_set(&mut self, idx: usize) {
+        let i = idx % COLOR_SETS.len();
+        self.data.color_set = i;
+        self.data.palette = COLOR_SETS[i].colors;
+    }
     fn push_undo(&mut self, a: Action) {
         self.undo.push(a);
         if self.undo.len() > 200 {
@@ -89,14 +119,14 @@ impl Doc {
 
     // ---- strokes ----
     pub fn add_stroke(&mut self, s: Stroke) {
-        self.dirty.push(s.bbox());
+        self.mark_stroke_dirty(&s);
         self.data.strokes.push(s.clone());
         self.push_undo(Action::AddStroke { stroke: s });
     }
     pub fn delete_stroke(&mut self, id: u64) -> bool {
         if let Some(i) = self.data.strokes.iter().position(|s| s.id == id) {
             let s = self.data.strokes.remove(i);
-            self.dirty.push(s.bbox());
+            self.mark_stroke_dirty(&s);
             self.push_undo(Action::DelStroke { stroke: s, index: i });
             return true;
         }
@@ -216,7 +246,7 @@ impl Doc {
             Action::AddStroke { stroke } => {
                 let id = stroke.id;
                 self.data.strokes.retain(|s| s.id != id);
-                self.dirty.push(stroke.bbox());
+                self.mark_stroke_dirty(&stroke);
                 (
                     (),
                     Action::AddStroke { stroke },
@@ -225,7 +255,7 @@ impl Doc {
             Action::DelStroke { stroke, index } => {
                 let i = index.min(self.data.strokes.len());
                 self.data.strokes.insert(i, stroke.clone());
-                self.dirty.push(stroke.bbox());
+                self.mark_stroke_dirty(&stroke);
                 (
                     (),
                     Action::DelStroke { stroke, index: i },
@@ -344,14 +374,14 @@ impl Doc {
         match a {
             Action::AddStroke { stroke } => {
                 self.data.strokes.push(stroke.clone());
-                self.dirty.push(stroke.bbox());
+                self.mark_stroke_dirty(&stroke);
                 let fx = ();
                 (fx, Action::AddStroke { stroke })
             }
             Action::DelStroke { stroke, index } => {
                 let id = stroke.id;
                 self.data.strokes.retain(|s| s.id != id);
-                self.dirty.push(stroke.bbox());
+                self.mark_stroke_dirty(&stroke);
                 let fx = ();
                 (fx, Action::DelStroke { stroke, index })
             }
@@ -456,6 +486,12 @@ impl Doc {
         if let Some(b) = self.content_bbox() {
             self.dirty.push(b.expand(200.0));
         }
+        // Loaded oil strokes get the grease blur on their first raster too.
+        for s in &self.data.strokes {
+            if s.tool == ToolSer::OilStick {
+                self.oil_dirty.push(s.bbox());
+            }
+        }
     }
 
     pub fn content_bbox(&self) -> Option<Rect> {
@@ -548,6 +584,63 @@ mod tests {
 
     fn stroke(id: u64) -> Stroke {
         Stroke { id, tool: ToolSer::Pen, color: 0, size: 4.0, points: vec![(0.0, 0.0), (5.0, 5.0)] }
+    }
+    fn oil_stroke(id: u64) -> Stroke {
+        Stroke { id, tool: ToolSer::OilStick, color: 3, size: 30.0, points: vec![(0.0, 0.0), (40.0, 10.0)] }
+    }
+    #[test]
+    fn color_set_switch_and_roundtrip() {
+        let mut d = Doc::new();
+        assert_eq!(d.data.color_set, 0);
+        d.apply_color_set(2);
+        assert_eq!(d.data.color_set, 2);
+        assert_eq!(d.data.palette, COLOR_SETS[2].colors);
+        assert_eq!(d.data.palette[0], [0xff, 0x00, 0x6e]); // Pop Hot Pink
+        // existing strokes recolor by index (same semantics as swatch editor)
+        d.add_stroke(stroke(1));
+        d.apply_color_set(4);
+        assert_eq!(d.data.strokes[0].color, 0);
+        // wraps
+        d.apply_color_set(99);
+        assert_eq!(d.data.color_set, 99 % COLOR_SETS.len());
+        // persists through save/load
+        d.apply_color_set(3);
+        let j = d.to_json().unwrap();
+        assert!(j.contains("\"color_set\""), "set index must persist in JSON");
+        let data = Doc::from_json(&j).unwrap();
+        assert_eq!(data.color_set, 3);
+        assert_eq!(data.palette, COLOR_SETS[3].colors);
+        // legacy files without the field load as Studio
+        let legacy = Doc::from_json(r#"{"strokes":[],"images":[],"texts":[]}"#).unwrap();
+        assert_eq!(legacy.color_set, 0);
+        assert_eq!(legacy.palette, COLOR_SETS[0].colors);
+    }
+    #[test]
+    fn oil_dirty_tracks_oil_strokes_only() {
+        let mut d = Doc::new();
+        d.add_stroke(stroke(1)); // pen
+        assert!(d.take_oil_dirty().is_empty(), "pen must not mark oil_dirty");
+        d.add_stroke(oil_stroke(2));
+        let od = d.take_oil_dirty();
+        assert_eq!(od.len(), 1, "oil stroke must mark oil_dirty");
+        assert!(od[0].x1 > 30.0, "oil dirty rect must cover the stroke");
+        // delete + undo/redo also track
+        d.delete_stroke(2);
+        assert_eq!(d.take_oil_dirty().len(), 1);
+        d.undo();
+        assert_eq!(d.take_oil_dirty().len(), 1);
+        d.redo();
+        assert_eq!(d.take_oil_dirty().len(), 1);
+    }
+    #[test]
+    fn load_data_marks_oil_dirty() {
+        let mut d = Doc::new();
+        d.add_stroke(oil_stroke(7));
+        let j = d.to_json().unwrap();
+        let data = Doc::from_json(&j).unwrap();
+        let mut d2 = Doc::new();
+        d2.load_data(data);
+        assert_eq!(d2.take_oil_dirty().len(), 1, "loaded oil strokes blur on first raster");
     }
     #[test]
     fn undo_redo_stroke() {
