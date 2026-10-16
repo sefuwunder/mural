@@ -5,10 +5,12 @@ mod brush;
 mod canvas;
 mod doc;
 mod palette;
+mod vector;
 
 use brush::{blit_stamp, walk_segment, TipCache, Tool};
-use canvas::{Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta};
+use canvas::{AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, VectorMeta};
 use doc::Doc;
+use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
 use palette::{COUNT as PALETTE_COUNT, PALETTE, PAPER, PAPER_DOT};
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, Mod};
@@ -121,6 +123,14 @@ enum DragKind {
     MoveItem,
     Stroke,
     Slider,
+    Speed,
+}
+
+#[derive(Clone, Copy)]
+enum PanelAction {
+    Anim(AnimKind),
+    PlayPause,
+    Fill,
 }
 
 struct App<'tc, 'ttf> {
@@ -135,6 +145,11 @@ struct App<'tc, 'ttf> {
     img_tex: HashMap<u64, Texture<'tc>>,
     text_tex: HashMap<u64, Texture<'tc>>,
     label_cache: HashMap<String, Texture<'tc>>,
+    vec_data: HashMap<u64, Vec<TracedPoly>>,
+    vec_tex: HashMap<u64, (Texture<'tc>, u64)>,
+    panel_hits: Vec<(SdlRect, PanelAction)>,
+    panel_speed: Option<SdlRect>,
+    last_frame: Instant,
     tool: UiTool,
     color_idx: usize,
     sizes: [f32; 4],
@@ -217,6 +232,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             img_tex: HashMap::new(),
             text_tex: HashMap::new(),
             label_cache: HashMap::new(),
+            vec_data: HashMap::new(),
+            vec_tex: HashMap::new(),
+            panel_hits: Vec::new(),
+            panel_speed: None,
+            last_frame: Instant::now(),
             tool: UiTool::Pencil,
             color_idx: 0,
             sizes: [Tool::Pencil.default_size(), Tool::Pen.default_size(), Tool::Marker.default_size(), Tool::OilStick.default_size()],
@@ -362,6 +382,21 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 return Some((SelKind::Text, t.id));
             }
         }
+        for v in self.doc.data.vectors.iter().rev() {
+            let (dx, dy) = self.move_delta_for(SelKind::Vector, v.id);
+            if !Rect::new(v.x + dx, v.y + dy, v.x + dx + v.sw, v.y + dy + v.sh).contains(wx, wy) {
+                continue;
+            }
+            let lx = (wx - v.x - dx) / v.sw * v.w;
+            let ly = (wy - v.y - dy) / v.sh * v.h;
+            let hit = match self.vec_data.get(&v.id) {
+                Some(polys) => polys.iter().any(|p| point_in_poly(lx, ly, &p.pts)),
+                None => true,
+            };
+            if hit {
+                return Some((SelKind::Vector, v.id));
+            }
+        }
         let thresh = 8.0 / self.cam.zoom;
         let mut best: Option<(f32, u64)> = None;
         for s in &self.doc.data.strokes {
@@ -479,6 +514,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         match kind {
             SelKind::Image => self.doc.data.images.iter().find(|m| m.id == id).map(|m| (m.x, m.y)).unwrap_or((0.0, 0.0)),
             SelKind::Text => self.doc.data.texts.iter().find(|t| t.id == id).map(|t| (t.x, t.y)).unwrap_or((0.0, 0.0)),
+            SelKind::Vector => self.doc.data.vectors.iter().find(|v| v.id == id).map(|v| (v.x, v.y)).unwrap_or((0.0, 0.0)),
             SelKind::Stroke => (0.0, 0.0),
         }
     }
@@ -514,6 +550,16 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 let t = ((sx - r.x()) as f32 / r.width() as f32).clamp(0.0, 1.0);
                 self.set_brush_size(1.0 + t * 95.0);
             }
+            DragKind::Speed => {
+                if let Some(r) = self.panel_speed {
+                    let t = ((sx - r.x()) as f32 / r.width() as f32).clamp(0.0, 1.0);
+                    if let Some((SelKind::Vector, id)) = self.selection {
+                        if let Some(vm) = self.doc.data.vectors.iter_mut().find(|v| v.id == id) {
+                            vm.speed = 0.25 + t * 2.75;
+                        }
+                    }
+                }
+            }
             DragKind::None => {}
         }
     }
@@ -541,6 +587,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     match kind {
                         SelKind::Image => self.doc.move_image(self.move_id, dx, dy),
                         SelKind::Text => self.doc.move_text(self.move_id, dx, dy),
+                        SelKind::Vector => self.doc.move_vector(self.move_id, dx, dy),
                         SelKind::Stroke => {}
                     }
                 }
@@ -607,6 +654,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.import_buf = Some(String::new());
                 video.text_input().start();
             }
+            Some(Keycode::X) if !ctrl => self.vectorize_selection(),
             Some(Keycode::LeftBracket) => self.set_brush_size(self.brush_size() / 1.25),
             Some(Keycode::RightBracket) => self.set_brush_size(self.brush_size() * 1.25),
             Some(Keycode::Z) if ctrl && !shift => self.do_undo(),
@@ -708,6 +756,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     self.doc.delete_text(id);
                     self.text_tex.remove(&id);
                 }
+                SelKind::Vector => {
+                    self.doc.delete_vector(id);
+                    self.vec_data.remove(&id);
+                    self.vec_tex.remove(&id);
+                }
             }
         }
     }
@@ -740,6 +793,15 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let live_tx: std::collections::HashSet<u64> =
             self.doc.data.texts.iter().map(|t| t.id).collect();
         self.text_tex.retain(|id, _| live_tx.contains(id));
+        let live_v: std::collections::HashSet<u64> =
+            self.doc.data.vectors.iter().map(|v| v.id).collect();
+        self.vec_tex.retain(|id, _| live_v.contains(id));
+        self.vec_data.retain(|id, _| live_v.contains(id));
+        for v in &self.doc.data.vectors.clone() {
+            if !self.vec_data.contains_key(&v.id) {
+                self.vec_data.insert(v.id, rebuild_polys(v));
+            }
+        }
         for t in &self.doc.data.texts.clone() {
             if !self.text_tex.contains_key(&t.id) {
                 if let Ok((tex, _, _)) = self.make_text_texture(&t.text, t.color, t.size) {
@@ -771,22 +833,224 @@ fn is_image_path(p: &Path) -> bool {
 impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn frame(&mut self) -> Result<(), String> {
         self.rerasterize();
+        // advance vector animations
+        let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
+        self.last_frame = Instant::now();
+        for v in self.doc.data.vectors.iter_mut() {
+            if v.playing && v.anim.animated() {
+                v.t += dt;
+            }
+        }
         self.canvas.set_draw_color(PAPER);
         self.canvas.clear();
         self.draw_grid();
         self.draw_tiles()?;
         self.draw_images()?;
+        self.draw_vectors()?;
         self.draw_texts()?;
         self.draw_active_stroke()?;
         self.draw_selection();
         self.draw_text_edit()?;
         self.draw_chrome()?;
+        self.draw_vector_panel()?;
         if self.show_help {
             self.draw_help()?;
         }
         self.draw_import_bar()?;
         self.draw_toast()?;
         self.canvas.present();
+        Ok(())
+    }
+
+    // ---------- vectors ----------
+    fn vectorize_selection(&mut self) {
+        let img_id = match self.selection {
+            Some((SelKind::Image, id)) => id,
+            _ => {
+                self.toast("select an image first (V), then X");
+                return;
+            }
+        };
+        let meta = match self.doc.data.images.iter().find(|m| m.id == img_id) {
+            Some(m) => m.clone(),
+            None => return,
+        };
+        let rgba = match image::open(&meta.path) {
+            Ok(i) => i.to_rgba8(),
+            Err(e) => {
+                self.toast(&format!("cannot open image: {}", e));
+                return;
+            }
+        };
+        let t0 = Instant::now();
+        match vectorize_rgba(rgba.as_raw(), rgba.width(), rgba.height()) {
+            Ok((polys, tw, th)) => {
+                let n = polys.len();
+                let id = self.doc.alloc_id();
+                let vm = VectorMeta {
+                    id,
+                    polys: polys.iter().map(|p| p.pts.clone()).collect(),
+                    w: tw as f32,
+                    h: th as f32,
+                    x: meta.x,
+                    y: meta.y,
+                    sw: meta.w,
+                    sh: meta.h,
+                    color: self.color_idx,
+                    filled: true,
+                    anim: AnimKind::Draw,
+                    speed: 1.0,
+                    playing: true,
+                    t: 0.0,
+                };
+                self.vec_data.insert(id, polys);
+                self.doc.add_vector(vm);
+                self.vec_tex.remove(&id);
+                self.selection = Some((SelKind::Vector, id));
+                self.toast(&format!("vectorized: {} shapes in {:.1}s", n, t0.elapsed().as_secs_f32()));
+            }
+            Err(e) => self.toast(&format!("vectorize: {}", e)),
+        }
+    }
+
+    fn vector_frame_idx(&self, id: u64) -> u64 {
+        match self.doc.data.vectors.iter().find(|v| v.id == id) {
+            Some(m) if m.anim.animated() && m.playing => (m.t * 24.0) as u64,
+            _ => u64::MAX, // static: render once
+        }
+    }
+
+    fn ensure_vector_texture(&mut self, id: u64) -> bool {
+        let idx = self.vector_frame_idx(id);
+        if let Some((_, last)) = self.vec_tex.get(&id) {
+            if *last == idx {
+                return true;
+            }
+        }
+        let (meta, polys) = match (
+            self.doc.data.vectors.iter().find(|v| v.id == id),
+            self.vec_data.get(&id),
+        ) {
+            (Some(m), Some(p)) => (m.clone(), p.clone()),
+            _ => return false,
+        };
+        let col = PALETTE[meta.color % PALETTE_COUNT].color;
+        let (buf, bw, bh) = render_frame(&meta, &polys, (col.r, col.g, col.b));
+        let mut owned = buf;
+        let surf = match sdl2::surface::Surface::from_data(&mut owned, bw, bh, bw * 4, PixelFormatEnum::RGBA32) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let tex = match self.tc.create_texture_from_surface(&surf) {
+            Ok(mut t) => {
+                t.set_blend_mode(BlendMode::Blend);
+                t
+            }
+            Err(_) => return false,
+        };
+        self.vec_tex.insert(id, (tex, idx));
+        true
+    }
+
+    fn draw_vectors(&mut self) -> Result<(), String> {
+        let ids: Vec<u64> = self.doc.data.vectors.iter().map(|v| v.id).collect();
+        for id in &ids {
+            self.ensure_vector_texture(*id);
+        }
+        let cam = self.cam;
+        let (w, h) = (self.win_w as f32, self.win_h as f32);
+        let items: Vec<(u64, f32, f32, f32, f32)> = self
+            .doc
+            .data
+            .vectors
+            .iter()
+            .map(|v| {
+                let (dx, dy) = self.move_delta_for(SelKind::Vector, v.id);
+                (v.id, v.x + dx, v.y + dy, v.sw, v.sh)
+            })
+            .collect();
+        for (id, x, y, sw, sh) in items {
+            if let Some((tex, _)) = self.vec_tex.get(&id) {
+                let (sx, sy) = cam.world_to_screen(x, y, w, h);
+                let dw = (sw * cam.zoom).max(1.0) as u32;
+                let dh = (sh * cam.zoom).max(1.0) as u32;
+                self.canvas.copy(tex, None, SdlRect::new(sx as i32, sy as i32, dw, dh))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn panel_action(&mut self, act: PanelAction) {
+        let id = match self.selection {
+            Some((SelKind::Vector, id)) => id,
+            _ => return,
+        };
+        let vm = match self.doc.data.vectors.iter_mut().find(|v| v.id == id) {
+            Some(v) => v,
+            None => return,
+        };
+        match act {
+            PanelAction::Anim(k) => {
+                vm.anim = k;
+                if k.animated() {
+                    vm.playing = true;
+                }
+                self.vec_tex.remove(&id);
+            }
+            PanelAction::PlayPause => {
+                vm.playing = !vm.playing;
+                self.vec_tex.remove(&id);
+            }
+            PanelAction::Fill => {
+                vm.filled = !vm.filled;
+                self.vec_tex.remove(&id);
+            }
+        }
+    }
+
+    fn draw_vector_panel(&mut self) -> Result<(), String> {
+        self.panel_hits.clear();
+        self.panel_speed = None;
+        let (anim, playing, filled, speed) = match self.selection {
+            Some((SelKind::Vector, id)) => match self.doc.data.vectors.iter().find(|v| v.id == id) {
+                Some(v) => (v.anim, v.playing, v.filled, v.speed),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let (w, h) = (self.win_w as i32, self.win_h as i32);
+        let pw = 700i32;
+        let px = (w - pw) / 2;
+        let py = h - BOT_H - 50;
+        self.canvas.set_draw_color(CHROME2);
+        self.canvas.fill_rect(SdlRect::new(px, py, pw as u32, 42))?;
+        self.canvas.set_draw_color(ACCENT);
+        self.canvas.draw_rect(SdlRect::new(px, py, pw as u32, 42))?;
+        let mut x = px + 8;
+        for k in AnimKind::all() {
+            let r = SdlRect::new(x, py + 7, 64, 28);
+            self.button(r, k.label(), anim == k)?;
+            self.panel_hits.push((r, PanelAction::Anim(k)));
+            x += 70;
+        }
+        let r = SdlRect::new(x, py + 7, 44, 28);
+        self.button(r, if playing { "II" } else { ">" }, false)?;
+        self.panel_hits.push((r, PanelAction::PlayPause));
+        x += 52;
+        let r = SdlRect::new(x, py + 7, 52, 28);
+        self.button(r, "Fill", filled)?;
+        self.panel_hits.push((r, PanelAction::Fill));
+        x += 60;
+        self.draw_label("speed", DIM, x, py + 12)?;
+        x += 52;
+        let sr = SdlRect::new(x, py + 7, 110, 28);
+        self.canvas.set_draw_color(CHROME);
+        self.canvas.fill_rect(sr)?;
+        let t = ((speed - 0.25) / 2.75).clamp(0.0, 1.0);
+        let fx = sr.x() + (t * sr.width() as f32) as i32;
+        self.canvas.set_draw_color(ACCENT);
+        self.canvas.fill_rect(SdlRect::new(fx - 3, sr.y(), 6, sr.height()))?;
+        self.panel_speed = Some(sr);
         Ok(())
     }
 
@@ -938,6 +1202,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 let (dx, dy) = self.move_delta_for(kind, id);
                 Rect::new(t.x + dx, t.y + dy, t.x + dx + t.w, t.y + dy + t.h)
             }),
+            SelKind::Vector => self.doc.data.vectors.iter().find(|v| v.id == id).map(|v| {
+                let (dx, dy) = self.move_delta_for(kind, id);
+                Rect::new(v.x + dx, v.y + dy, v.x + dx + v.sw, v.y + dy + v.sh)
+            }),
         };
         if let Some(r) = r {
             let (w, h) = (self.win_w as f32, self.win_h as f32);
@@ -1015,7 +1283,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let zoom_txt = format!("{}%", (self.cam.zoom * 100.0).round() as i32);
         self.draw_label(&zoom_txt, DIM, w - 320, 12)?;
         // top-right buttons
-        self.button(SdlRect::new(w - 220, 8, 64, 28), "Save", false)?;
+        self.button(SdlRect::new(w - 292, 8, 64, 28), "Save", false)?;
+        self.button(SdlRect::new(w - 220, 8, 64, 28), "Vec", false)?;
         self.button(SdlRect::new(w - 148, 8, 64, 28), "PNG", false)?;
         self.button(SdlRect::new(w - 76, 8, 64, 28), "?", self.show_help)?;
         // left toolbar
@@ -1071,6 +1340,25 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         for i in 0..PALETTE_COUNT {
             if self.swatch_rect(i).contains_point((sx, sy)) {
                 self.color_idx = i;
+                if let Some((SelKind::Vector, id)) = self.selection {
+                    if let Some(vm) = self.doc.data.vectors.iter_mut().find(|v| v.id == id) {
+                        vm.color = i;
+                        self.vec_tex.remove(&id);
+                    }
+                }
+                return;
+            }
+        }
+        // vector panel hits
+        for (r, act) in self.panel_hits.clone() {
+            if r.contains_point((sx, sy)) {
+                self.panel_action(act);
+                return;
+            }
+        }
+        if let Some(r) = self.panel_speed {
+            if r.contains_point((sx, sy)) {
+                self.drag = DragKind::Speed;
                 return;
             }
         }
@@ -1084,8 +1372,12 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         }
         // top-right buttons
         let w = self.win_w as i32;
-        if SdlRect::new(w - 220, 8, 64, 28).contains_point((sx, sy)) {
+        if SdlRect::new(w - 292, 8, 64, 28).contains_point((sx, sy)) {
             self.save_doc();
+            return;
+        }
+        if SdlRect::new(w - 220, 8, 64, 28).contains_point((sx, sy)) {
+            self.vectorize_selection();
             return;
         }
         if SdlRect::new(w - 148, 8, 64, 28).contains_point((sx, sy)) {
@@ -1305,6 +1597,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn export_png(&mut self) {
+        let ids: Vec<u64> = self.doc.data.vectors.iter().map(|v| v.id).collect();
+        for id in ids {
+            self.ensure_vector_texture(id);
+        }
         match self.render_export("mural.png") {
             Ok(_) => self.toast("exported mural.png"),
             Err(e) => self.toast(&format!("export failed: {}", e)),
@@ -1327,6 +1623,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             let doc = &self.doc;
             let img_tex = &self.img_tex;
             let text_tex = &self.text_tex;
+            let vec_tex = &self.vec_tex;
             let canvas = &mut self.canvas;
             canvas
                 .with_texture_canvas(&mut target, |c| {
@@ -1346,6 +1643,15 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                                 tex,
                                 None,
                                 SdlRect::new((m.x - ox) as i32, (m.y - oy) as i32, m.w as u32, m.h as u32),
+                            );
+                        }
+                    }
+                    for v in &doc.data.vectors {
+                        if let Some((tex, _)) = vec_tex.get(&v.id) {
+                            let _ = c.copy(
+                                tex,
+                                None,
+                                SdlRect::new((v.x - ox) as i32, (v.y - oy) as i32, v.sw as u32, v.sh as u32),
                             );
                         }
                     }
@@ -1448,18 +1754,84 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             h,
         });
         self.text_tex.insert(id, tex);
-        // generated test image
+        // generated test image: high-contrast B/W checker (vectorize likes contrast)
         let img = image::RgbaImage::from_fn(160, 160, |x, y| {
             if (x / 20 + y / 20) % 2 == 0 {
-                image::Rgba([200, 60, 60, 255])
+                image::Rgba([15, 15, 15, 255])
             } else {
-                image::Rgba([60, 60, 200, 255])
+                image::Rgba([245, 245, 245, 255])
             }
         });
         img.save("/tmp/mural_test_img.png").map_err(|e| e.to_string())?;
         self.import_image_file(Path::new("/tmp/mural_test_img.png"), 60.0, 200.0);
+        // vectorize the checker straight from pixels
+        let rgba = image::open("/tmp/mural_test_img.png").map_err(|e| e.to_string())?.to_rgba8();
+        let (vpolys, tw, th) = vectorize_rgba(rgba.as_raw(), rgba.width(), rgba.height())?;
+        assert!(vpolys.len() >= 16, "checker should trace to many polys, got {}", vpolys.len());
+        let vid = self.doc.alloc_id();
+        let vm = VectorMeta {
+            id: vid,
+            polys: vpolys.iter().map(|p| p.pts.clone()).collect(),
+            w: tw as f32,
+            h: th as f32,
+            x: -260.0,
+            y: 330.0,
+            sw: 220.0,
+            sh: 220.0,
+            color: 4,
+            filled: true,
+            anim: AnimKind::Wave,
+            speed: 1.0,
+            playing: true,
+            t: 0.0,
+        };
+        self.vec_data.insert(vid, vpolys);
+        self.doc.add_vector(vm);
+        // render several animation frames; frames must differ while playing
+        let mut prev: Vec<u8> = vec![];
+        for tt in [0.0f32, 0.4, 0.9] {
+            if let Some(m) = self.doc.data.vectors.iter_mut().find(|v| v.id == vid) {
+                m.t = tt;
+            }
+            self.vec_tex.remove(&vid);
+            assert!(self.ensure_vector_texture(vid));
+            let (tex, _) = &self.vec_tex[&vid];
+            let _ = tex;
+            let meta = self.doc.data.vectors.iter().find(|v| v.id == vid).unwrap().clone();
+            let polys = self.vec_data[&vid].clone();
+            let (buf, _, _) = render_frame(&meta, &polys, (194, 47, 61));
+            assert!(buf.iter().any(|&b| b > 0));
+            if !prev.is_empty() {
+                assert_ne!(buf, prev, "wave frames should differ");
+            }
+            prev = buf;
+        }
+        // draw-on frame renders a partial reveal
+        if let Some(m) = self.doc.data.vectors.iter_mut().find(|v| v.id == vid) {
+            m.anim = AnimKind::Draw;
+            m.t = 0.1;
+        }
+        self.vec_tex.remove(&vid);
+        assert!(self.ensure_vector_texture(vid));
+        // undo the vector, redo it
+        let nv0 = self.doc.data.vectors.len();
+        self.doc.undo();
+        assert_eq!(self.doc.data.vectors.len(), nv0 - 1);
+        self.doc.redo();
+        assert_eq!(self.doc.data.vectors.len(), nv0);
+        // still frame for the export visual
+        if let Some(m) = self.doc.data.vectors.iter_mut().find(|v| v.id == vid) {
+            m.anim = AnimKind::Still;
+            m.playing = false;
+            m.t = 0.0;
+        }
+        self.vec_tex.remove(&vid);
         self.sync_media();
         self.rerasterize();
+        let vids: Vec<u64> = self.doc.data.vectors.iter().map(|v| v.id).collect();
+        for id in vids {
+            assert!(self.ensure_vector_texture(id));
+        }
         self.render_export("/tmp/mural_smoke.png")?;
         println!("smoke: exported /tmp/mural_smoke.png");
         // exercise the full interactive frame path (chrome, help, toast)

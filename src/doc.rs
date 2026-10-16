@@ -1,7 +1,7 @@
 //! Document: strokes/images/texts + undo/redo + save/load.
 //! Pure data (no SDL) except via canvas types.
 
-use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta};
+use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta, VectorMeta};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
@@ -12,6 +12,9 @@ enum Action {
     DelImage { meta: ImageMeta, index: usize },
     AddText { meta: TextMeta },
     DelText { meta: TextMeta, index: usize },
+    AddVector { meta: VectorMeta },
+    DelVector { meta: VectorMeta, index: usize },
+    MoveVector { id: u64, dx: f32, dy: f32 },
     MoveImage { id: u64, dx: f32, dy: f32 },
     MoveText { id: u64, dx: f32, dy: f32 },
 }
@@ -21,6 +24,8 @@ pub struct DocData {
     pub strokes: Vec<Stroke>,
     pub images: Vec<ImageMeta>,
     pub texts: Vec<TextMeta>,
+    #[serde(default)]
+    pub vectors: Vec<VectorMeta>,
 }
 
 pub struct Doc {
@@ -117,6 +122,28 @@ impl Doc {
             self.push_undo(Action::MoveText { id, dx, dy });
         }
     }
+    // ---- vectors ----
+    pub fn add_vector(&mut self, m: VectorMeta) {
+        self.data.vectors.push(m.clone());
+        self.push_undo(Action::AddVector { meta: m });
+    }
+    pub fn delete_vector(&mut self, id: u64) -> Option<VectorMeta> {
+        let i = self.data.vectors.iter().position(|m| m.id == id)?;
+        let m = self.data.vectors.remove(i);
+        self.push_undo(Action::DelVector { meta: m.clone(), index: i });
+        Some(m)
+    }
+    pub fn move_vector(&mut self, id: u64, dx: f32, dy: f32) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        if let Some(m) = self.data.vectors.iter_mut().find(|m| m.id == id) {
+            m.x += dx;
+            m.y += dy;
+            self.push_undo(Action::MoveVector { id, dx, dy });
+        }
+    }
+
     pub fn set_text(&mut self, id: u64, text: String, w: f32, h: f32) {
         if let Some(m) = self.data.texts.iter_mut().find(|m| m.id == id) {
             m.text = text;
@@ -219,6 +246,32 @@ impl Doc {
                     Action::MoveText { id, dx, dy },
                 )
             }
+            Action::AddVector { meta } => {
+                let id = meta.id;
+                self.data.vectors.retain(|m| m.id != id);
+                (
+                    (),
+                    Action::AddVector { meta },
+                )
+            }
+            Action::DelVector { meta, index } => {
+                let i = index.min(self.data.vectors.len());
+                self.data.vectors.insert(i, meta.clone());
+                (
+                    (),
+                    Action::DelVector { meta, index: i },
+                )
+            }
+            Action::MoveVector { id, dx, dy } => {
+                if let Some(m) = self.data.vectors.iter_mut().find(|m| m.id == id) {
+                    m.x -= dx;
+                    m.y -= dy;
+                }
+                (
+                    (),
+                    Action::MoveVector { id, dx, dy },
+                )
+            }
         }
     }
 
@@ -277,6 +330,22 @@ impl Doc {
                 let fx = ();
                 (fx, Action::MoveText { id, dx, dy })
             }
+            Action::AddVector { meta } => {
+                self.data.vectors.push(meta.clone());
+                ((), Action::AddVector { meta })
+            }
+            Action::DelVector { meta, index } => {
+                let id = meta.id;
+                self.data.vectors.retain(|m| m.id != id);
+                ((), Action::DelVector { meta, index })
+            }
+            Action::MoveVector { id, dx, dy } => {
+                if let Some(m) = self.data.vectors.iter_mut().find(|m| m.id == id) {
+                    m.x += dx;
+                    m.y += dy;
+                }
+                ((), Action::MoveVector { id, dx, dy })
+            }
         }
     }
 
@@ -296,6 +365,7 @@ impl Doc {
             .map(|s| s.id)
             .chain(self.data.images.iter().map(|m| m.id))
             .chain(self.data.texts.iter().map(|m| m.id))
+            .chain(self.data.vectors.iter().map(|m| m.id))
             .max()
             .unwrap_or(0)
             + 1;
@@ -321,6 +391,9 @@ impl Doc {
         }
         for t in &self.data.texts {
             acc(t.rect());
+        }
+        for v in &self.data.vectors {
+            acc(v.rect());
         }
         r
     }

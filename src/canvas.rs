@@ -204,6 +204,61 @@ pub enum SelKind {
     Stroke,
     Image,
     Text,
+    Vector,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnimKind {
+    Still,
+    Draw,
+    Wave,
+    Spin,
+    Pulse,
+    March,
+}
+
+impl AnimKind {
+    pub fn all() -> [AnimKind; 6] {
+        [AnimKind::Still, AnimKind::Draw, AnimKind::Wave, AnimKind::Spin, AnimKind::Pulse, AnimKind::March]
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            AnimKind::Still => "Still",
+            AnimKind::Draw => "Draw",
+            AnimKind::Wave => "Wave",
+            AnimKind::Spin => "Spin",
+            AnimKind::Pulse => "Pulse",
+            AnimKind::March => "March",
+        }
+    }
+    pub fn animated(self) -> bool {
+        !matches!(self, AnimKind::Still)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VectorMeta {
+    pub id: u64,
+    pub polys: Vec<Vec<(f32, f32)>>, // local px coords (trace resolution)
+    pub w: f32,
+    pub h: f32, // local px dims
+    pub x: f32,
+    pub y: f32, // world top-left
+    pub sw: f32,
+    pub sh: f32, // world size
+    pub color: usize,
+    pub filled: bool,
+    pub anim: AnimKind,
+    pub speed: f32,
+    pub playing: bool,
+    #[serde(default)]
+    pub t: f32,
+}
+
+impl VectorMeta {
+    pub fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.x + self.sw, self.y + self.sh)
+    }
 }
 
 #[cfg(test)]
