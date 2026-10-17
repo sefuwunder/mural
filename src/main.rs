@@ -53,6 +53,7 @@ enum UiTool {
     Pen,
     Marker,
     OilStick,
+    Charcoal,
     Text,
 }
 impl UiTool {
@@ -62,6 +63,7 @@ impl UiTool {
             UiTool::Pen => Some(Tool::Pen),
             UiTool::Marker => Some(Tool::Marker),
             UiTool::OilStick => Some(Tool::OilStick),
+            UiTool::Charcoal => Some(Tool::Charcoal),
             _ => None,
         }
     }
@@ -73,6 +75,7 @@ impl UiTool {
             UiTool::Pen => "N",
             UiTool::Marker => "M",
             UiTool::OilStick => "O",
+            UiTool::Charcoal => "K",
             UiTool::Text => "T",
         }
     }
@@ -84,17 +87,19 @@ impl UiTool {
             UiTool::Pen => "Pen",
             UiTool::Marker => "Marker",
             UiTool::OilStick => "Oil",
+            UiTool::Charcoal => "Charcoal",
             UiTool::Text => "Text",
         }
     }
 }
-const TOOLS: [UiTool; 7] = [
+const TOOLS: [UiTool; 8] = [
     UiTool::Select,
     UiTool::Pan,
     UiTool::Pencil,
     UiTool::Pen,
     UiTool::Marker,
     UiTool::OilStick,
+    UiTool::Charcoal,
     UiTool::Text,
 ];
 
@@ -104,6 +109,7 @@ fn tool_index(t: UiTool) -> usize {
         UiTool::Pen => 1,
         UiTool::Marker => 2,
         UiTool::OilStick => 3,
+        UiTool::Charcoal => 4,
         _ => 0,
     }
 }
@@ -267,7 +273,7 @@ struct App<'tc, 'ttf> {
     last_frame: Instant,
     tool: UiTool,
     color_idx: usize,
-    sizes: [f32; 4],
+    sizes: [f32; 5],
     selection: Option<(SelKind, u64)>,
     drag: DragKind,
     // drag state
@@ -373,7 +379,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             last_frame: Instant::now(),
             tool: UiTool::Pencil,
             color_idx: 0,
-            sizes: [Tool::Pencil.default_size(), Tool::Pen.default_size(), Tool::Marker.default_size(), Tool::OilStick.default_size()],
+            sizes: [Tool::Pencil.default_size(), Tool::Pen.default_size(), Tool::Marker.default_size(), Tool::OilStick.default_size(), Tool::Charcoal.default_size()],
             selection: None,
             drag: DragKind::None,
             drag_sx: 0.0,
@@ -1116,6 +1122,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             Some(Keycode::N) if !ctrl => self.set_tool(UiTool::Pen),
             Some(Keycode::M) if !ctrl => self.set_tool(UiTool::Marker),
             Some(Keycode::O) if !ctrl => self.set_tool(UiTool::OilStick),
+            Some(Keycode::K) if !ctrl => self.set_tool(UiTool::Charcoal),
             Some(Keycode::T) if !ctrl => self.set_tool(UiTool::Text),
             Some(Keycode::I) if !ctrl => {
                 self.import_buf = Some(String::new());
@@ -2312,6 +2319,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.cc(bg);
                 self.fill_circ(cx - 5, cy - 5, 3)?;
             }
+            UiTool::Charcoal => {
+                // charcoal stick: chunky diagonal chunk, crumbled tip, dust
+                self.thick_line(cx - 9, cy + 9, cx + 5, cy - 5, 7)?;
+                self.thick_line(cx + 5, cy - 5, cx + 10, cy - 10, 4)?;
+                self.fill_circ(cx - 12, cy + 11, 1)?;
+                self.fill_circ(cx + 11, cy + 10, 1)?;
+                self.fill_circ(cx - 1, cy - 12, 1)?;
+            }
             UiTool::Text => {
                 self.draw_label("A", fg, cx - 8, cy - 11)?;
             }
@@ -2549,7 +2564,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "MURAL — shortcuts",
             "",
             "V move/select   H pan (or space / mid-drag)",
-            "P pencil  N pen  M marker  O oil stick",
+            "P pencil  N pen  M marker  O oil stick  K charcoal",
             "T text: click = point text, drag = text box",
             "text box panel: shape (no/rect/oval), align, size",
             "drag box corners to resize; double-click to re-edit",
@@ -3027,7 +3042,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
 
     /// Headless self-test: synthetic strokes/text/image, then export.
     fn smoke(&mut self) -> Result<(), String> {
-        for (i, tool) in [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick].iter().enumerate() {
+        for (i, tool) in [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick, Tool::Charcoal].iter().enumerate() {
             let id = self.doc.alloc_id();
             let y = i as f32 * 110.0 - 165.0;
             let pts: Vec<(f32, f32)> = (0..48)

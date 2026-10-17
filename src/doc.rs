@@ -509,6 +509,7 @@ impl Doc {
 mod tests {
     use super::*;
     use crate::audio::{b64encode, mulaw_encode};
+    use crate::brush::Tool;
     use crate::canvas::ToolSer;
 
     fn clip(id: u64) -> AudioClip {
@@ -569,6 +570,19 @@ mod tests {
     }
     fn oil_stroke(id: u64) -> Stroke {
         Stroke { id, tool: ToolSer::OilStick, color: 3, size: 30.0, points: vec![(0.0, 0.0), (40.0, 10.0)] }
+    }
+    #[test]
+    fn charcoal_stroke_roundtrip() {
+        // new ToolSer variant must survive save/load (and old files without
+        // it must still load — covered by the legacy color_set test above)
+        let mut d = Doc::new();
+        d.add_stroke(Stroke { id: 9, tool: ToolSer::Charcoal, color: 5, size: 18.0, points: vec![(0.0, 0.0), (20.0, 20.0)] });
+        let j = d.to_json().unwrap();
+        assert!(j.contains("\"Charcoal\""), "charcoal tool must serialize by name");
+        let data = Doc::from_json(&j).unwrap();
+        assert_eq!(data.strokes.len(), 1);
+        assert_eq!(data.strokes[0].tool, ToolSer::Charcoal);
+        assert_eq!(Tool::from(data.strokes[0].tool), Tool::Charcoal);
     }
     #[test]
     fn color_set_switch_and_roundtrip() {

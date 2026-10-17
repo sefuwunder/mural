@@ -16,6 +16,7 @@ pub enum Tool {
     Pen,
     Marker,
     OilStick,
+    Charcoal,
 }
 
 impl Tool {
@@ -23,7 +24,7 @@ impl Tool {
     pub fn spacing(self) -> f32 {
         match self {
             Tool::Pencil | Tool::Pen => 0.35,
-            Tool::Marker => 0.45,
+            Tool::Marker | Tool::Charcoal => 0.45,
             Tool::OilStick => 0.55,
         }
     }
@@ -33,6 +34,7 @@ impl Tool {
             Tool::Pen => 5.0,
             Tool::Marker => 22.0,
             Tool::OilStick => 30.0,
+            Tool::Charcoal => 18.0,
         }
     }
 }
@@ -94,6 +96,26 @@ pub fn make_tip<'a>(
                         // edges read as dry-brush, like bristle marks on a
                         // real oil stick (cf. reference swatch photos)
                         a *= 0.88 + 0.12 * hash01((x as f32 / 2.0) as i32, y as i32, 101);
+                    }
+                    Tool::Charcoal => {
+                        // vine charcoal: powdery and grainy, catching the
+                        // paper tooth — pigment sits on the highs and skips
+                        // the lows, like real charcoal on textured paper.
+                        // coarse grain cells + ragged crumbly edge.
+                        let tooth =
+                            hash01((x as f32 / 3.0) as i32, (y as f32 / 3.0) as i32, 7);
+                        // ragged edge: effective radius wobbles with angle
+                        let theta = (y as f32 + 0.5 - r).atan2(x as f32 + 0.5 - r);
+                        let wobble = 0.86 + 0.14 * hash01((theta * 5.0) as i32, 11, 8);
+                        let dd = dist / wobble;
+                        let body = (1.0 - dd.powf(1.8)).clamp(0.0, 1.0);
+                        a = body.powf(0.9) * 0.92;
+                        // paper tooth: pigment on highs, skip lows
+                        a *= 0.22 + 0.78 * tooth.powf(1.6);
+                        // occasional dark clumps where the stick crumbles
+                        if hash01(x as i32, y as i32, 9) < 0.05 {
+                            a = (a * 1.2).min(1.0);
+                        }
                     }
                 }
                 let o = ((y * d + x) * 4) as usize;
@@ -409,7 +431,7 @@ mod tests {
     use super::*;
     #[test]
     fn tool_spacing_sane() {
-        for t in [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick] {
+        for t in [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick, Tool::Charcoal] {
             assert!(t.spacing() > 0.0 && t.spacing() < 1.0);
             assert!(t.default_size() > 0.0);
         }
