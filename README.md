@@ -63,7 +63,7 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 | key | action |
 |---|---|
 | V / H | move · pan |
-| P N M O | pencil · pen · marker · oil stick |
+| P N M O K S | pencil · pen · marker · oil stick · charcoal · smudge |
 | T | text |
 | `[` `]` | brush size |
 | I | import folder |
