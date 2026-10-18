@@ -7,6 +7,7 @@ mod canvas;
 mod cmd;
 mod doc;
 mod palette;
+mod perform;
 mod vector;
 
 use audio::{AudioClip, CLIP_RADIUS};
@@ -14,6 +15,7 @@ use brush::{blit_stamp, box_blur_rgba, clamp_brush_size, clamp_spacing, light_oi
 use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, ToolSer, VectorMeta};
 use cmd::{Command, ParseError, Prop, SetOp, SetVal, ToolName};
 use doc::Doc;
+use perform::{playback_target, toggle_vector, PerformState, PlayTarget};
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
 use palette::{COUNT as PALETTE_COUNT, COLOR_SETS, PAPER_DOT};
 use sdl2::audio::{AudioCallback, AudioDevice, AudioQueue, AudioSpecDesired};
@@ -281,6 +283,13 @@ enum PanelAction {
     Fill,
 }
 
+/// Transport-overlay buttons (perform mode).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PerformAction {
+    TogglePause,
+    Exit,
+}
+
 struct App<'tc, 'ttf> {
     canvas: Canvas<Window>,
     tc: &'tc TextureCreator<WindowContext>,
@@ -340,7 +349,11 @@ struct App<'tc, 'ttf> {
     // voice clips
     audio_ss: Option<AudioSubsystem>,
     rec: Option<RecState>,
-    playing: Option<PlayState>,
+    playing: Vec<PlayState>, // every currently-playing clip (perform mode plays all at once)
+    // global perform mode (Shift+P)
+    perform: PerformState,
+    perform_paused: bool,
+    perform_hits: Vec<(SdlRect, PerformAction)>,
     mouse_sx: i32,
     mouse_sy: i32,
 }
@@ -445,7 +458,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             tbox: None,
             audio_ss: None,
             rec: None,
-            playing: None,
+            playing: Vec::new(),
+            perform: PerformState::new(),
+            perform_paused: false,
+            perform_hits: Vec::new(),
             mouse_sx: win_w as i32 / 2,
             mouse_sy: win_h as i32 / 2,
             start: Instant::now(),
@@ -799,6 +815,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn bg_rect(&self) -> SdlRect {
         SdlRect::new(self.win_w as i32 - 368, 8, 60, 28)
     }
+    /// Top-bar perform-mode transport button (Shift+P).
+    fn perform_button_rect(&self) -> SdlRect {
+        SdlRect::new(110, 8, 64, 28)
+    }
     fn color_popup_rect(&self) -> SdlRect {
         let (w, h) = (self.win_w as i32, self.win_h as i32);
         SdlRect::new((w - 320) / 2, (h - 230) / 2, 320, 230)
@@ -951,6 +971,21 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn on_down(&mut self, sx: i32, sy: i32, btn: MouseButton, video: &sdl2::VideoSubsystem) {
+        // perform mode: only the transport overlay is clickable; canvas input suspended
+        if self.perform.is_active() {
+            // the top-bar transport button still toggles while active
+            if self.perform_button_rect().contains_point((sx, sy)) {
+                self.toggle_perform();
+                return;
+            }
+            for (r, act) in self.perform_hits.clone() {
+                if r.contains_point((sx, sy)) {
+                    self.perform_action(act);
+                    return;
+                }
+            }
+            return;
+        }
         // right-click on a swatch / bg swatch opens the color editor;
         // right-click on the set chip cycles to the previous color set
         if btn == MouseButton::Right {
@@ -1086,6 +1121,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn on_motion(&mut self, sx: i32, sy: i32) {
+        if self.perform.is_active() {
+            return; // canvas input suspended in perform mode
+        }
         match self.drag {
             DragKind::Pan => {
                 let dx = (sx as f32 - self.drag_sx) / self.cam.zoom;
@@ -1188,6 +1226,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn on_up(&mut self, _btn: MouseButton, video: &sdl2::VideoSubsystem) {
+        if self.perform.is_active() {
+            return; // canvas input suspended in perform mode
+        }
         match self.drag {
             DragKind::TextBox => {
                 if let Some((x0, y0, x1, y1)) = self.tbox.take() {
@@ -1280,6 +1321,16 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             return true;
         }
 
+        // --- perform mode takes over the keyboard ---
+        if self.perform.is_active() {
+            match keycode {
+                Some(Keycode::Escape) => self.exit_perform(),
+                Some(Keycode::P) if shift && !ctrl => self.exit_perform(),
+                _ => {}
+            }
+            return true;
+        }
+
         match keycode {
             Some(Keycode::Escape) => {
                 if self.rec.is_some() {
@@ -1301,7 +1352,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             Some(Keycode::F1) => self.show_help = !self.show_help,
             Some(Keycode::V) if !ctrl => self.set_tool(UiTool::Select),
             Some(Keycode::H) if !ctrl => self.set_tool(UiTool::Pan),
-            Some(Keycode::P) if !ctrl => self.set_tool(UiTool::Pencil),
+            Some(Keycode::P) if !ctrl && !shift => self.toggle_selection_playback(),
+            Some(Keycode::P) if !ctrl && shift => self.toggle_perform(),
             Some(Keycode::N) if !ctrl => self.set_tool(UiTool::Pen),
             Some(Keycode::M) if !ctrl => self.set_tool(UiTool::Marker),
             Some(Keycode::O) if !ctrl => self.set_tool(UiTool::OilStick),
@@ -1671,9 +1723,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 }
                 SelKind::Clip => {
                     self.doc.delete_clip(id);
-                    if self.playing.as_ref().map(|p| p.clip_id == id).unwrap_or(false) {
-                        self.playing = None;
-                    }
+                    self.playing.retain(|p| p.clip_id != id);
                 }
             }
         }
@@ -1756,7 +1806,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let k = (dt * 9.0).min(1.0);
         self.ui_fade += (target - self.ui_fade) * k;
         for v in self.doc.data.vectors.iter_mut() {
-            if v.playing && v.anim.animated() {
+            if v.playing && v.anim.animated() && !self.perform_paused {
                 v.t += dt;
             }
         }
@@ -1784,6 +1834,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         }
         self.draw_import_bar()?;
         self.draw_cmdline()?;
+        self.draw_perform_bar()?;
         self.draw_toast()?;
         self.canvas.present();
         Ok(())
@@ -1821,7 +1872,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 dev.resume();
                 self.rec = Some(RecState { _dev: dev, buf, start: Instant::now(), freq });
                 // stop any playback while recording
-                self.playing = None;
+                self.playing.clear();
             }
             Err(e) => self.toast(&format!("no mic ({})", e)),
         }
@@ -1869,59 +1920,69 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
 
     /// Double-click toggles; Space plays (never stops, so key-repeat is safe).
     fn toggle_play(&mut self, id: u64) {
-        if self.playing.as_ref().map(|p| p.clip_id == id).unwrap_or(false) {
-            self.playing = None;
+        if self.playing.iter().any(|p| p.clip_id == id) {
+            self.playing.retain(|p| p.clip_id != id);
             return;
         }
         self.play_clip(id);
     }
 
     fn play_clip_if_idle(&mut self, id: u64) {
-        if self.playing.as_ref().map(|p| p.clip_id == id).unwrap_or(false) {
+        if self.playing.iter().any(|p| p.clip_id == id) {
             return;
         }
         self.play_clip(id);
     }
 
     fn play_clip(&mut self, id: u64) {
-        let clip = match self.doc.data.clips.iter().find(|c| c.id == id) {
-            Some(c) => c.clone(),
-            None => return,
-        };
-        let pcm = match clip.pcm() {
-            Ok(p) if !p.is_empty() => p,
-            _ => {
-                self.toast("clip data corrupt");
-                return;
-            }
-        };
-        let ss = match &self.audio_ss {
-            Some(ss) => ss.clone(),
-            None => {
-                self.toast("no audio subsystem");
-                return;
-            }
-        };
+        if let Err(e) = self.start_clip(id) {
+            self.toast(&e);
+        }
+    }
+
+    /// Start one clip. Quiet on failure (returns Err) so perform mode can
+    /// start everything without toast spam; `play_clip` surfaces the error.
+    fn start_clip(&mut self, id: u64) -> Result<(), String> {
+        let clip = self
+            .doc
+            .data
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()
+            .ok_or_else(|| "clip gone".to_string())?;
+        let pcm = clip
+            .pcm()
+            .map_err(|_| "clip data corrupt".to_string())
+            .and_then(|p| {
+                if p.is_empty() {
+                    Err("clip data corrupt".to_string())
+                } else {
+                    Ok(p)
+                }
+            })?;
+        let ss = self.audio_ss.clone().ok_or_else(|| "no audio subsystem".to_string())?;
         match ss.open_queue::<i16, _>(None::<&str>, &Self::clip_spec()) {
             Ok(q) => {
-                if q.queue_audio(&pcm).is_err() {
-                    self.toast("playback failed");
-                    return;
-                }
+                q.queue_audio(&pcm).map_err(|_| "playback failed".to_string())?;
                 q.resume();
-                self.playing = Some(PlayState { _q: q, clip_id: id, start: Instant::now(), seconds: clip.seconds.max(0.1) });
+                // one entry per clip: a restart replaces the old one
+                self.playing.retain(|p| p.clip_id != id);
+                self.playing.push(PlayState {
+                    _q: q,
+                    clip_id: id,
+                    start: Instant::now(),
+                    seconds: clip.seconds.max(0.1),
+                });
+                Ok(())
             }
-            Err(e) => self.toast(&format!("no audio out ({})", e)),
+            Err(e) => Err(format!("no audio out ({})", e)),
         }
     }
 
     fn poll_audio(&mut self) {
-        // finish playback
-        if let Some(p) = &self.playing {
-            if p.start.elapsed().as_secs_f32() >= p.seconds {
-                self.playing = None;
-            }
-        }
+        // finish playback: any clip whose time is up drops out
+        self.playing.retain(|p| p.start.elapsed().as_secs_f32() < p.seconds);
         // auto-stop at the length cap
         if let Some(r) = &self.rec {
             if r.start.elapsed().as_secs() >= audio::CLIP_MAX_SECS as u64 {
@@ -1962,7 +2023,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             let sr = (CLIP_RADIUS as f32 * cam.zoom).max(8.0) as i32;
             let (cx, cy) = (sx as i32, sy as i32);
             let selected = self.selection == Some((SelKind::Clip, c.id));
-            let playing = self.playing.as_ref().map(|p| p.clip_id == c.id).unwrap_or(false);
+            let playing = self.playing.iter().find(|p| p.clip_id == c.id);
             // badge
             let bg = self.bg_color();
             self.canvas.set_draw_color(Color::RGBA(bg.r, bg.g, bg.b, 220));
@@ -1971,33 +2032,27 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             draw_circle(&mut self.canvas, cx, cy, sr)?;
             draw_mic_glyph(&mut self.canvas, cx, cy, sr)?;
             // playing: progress ring + elapsed readout in the label
-            if playing {
-                if let Some(p) = &self.playing {
-                    let frac = (p.start.elapsed().as_secs_f32() / p.seconds).min(1.0);
-                    self.canvas.set_draw_color(ACCENT);
-                    let mut prev: Option<(i32, i32)> = None;
-                    let steps = (frac * 48.0) as i32;
-                    for i in 0..=steps.max(1) {
-                        let a = -std::f32::consts::FRAC_PI_2 + i as f32 / 48.0 * std::f32::consts::TAU;
-                        let rr = sr + 4;
-                        let pt = (
-                            cx + (rr as f32 * a.cos()) as i32,
-                            cy + (rr as f32 * a.sin()) as i32,
-                        );
-                        if let Some(q) = prev {
-                            self.canvas.draw_line(q, pt)?;
-                        }
-                        prev = Some(pt);
+            if let Some(p) = playing {
+                let frac = (p.start.elapsed().as_secs_f32() / p.seconds).min(1.0);
+                self.canvas.set_draw_color(ACCENT);
+                let mut prev: Option<(i32, i32)> = None;
+                let steps = (frac * 48.0) as i32;
+                for i in 0..=steps.max(1) {
+                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 / 48.0 * std::f32::consts::TAU;
+                    let rr = sr + 4;
+                    let pt = (
+                        cx + (rr as f32 * a.cos()) as i32,
+                        cy + (rr as f32 * a.sin()) as i32,
+                    );
+                    if let Some(q) = prev {
+                        self.canvas.draw_line(q, pt)?;
                     }
+                    prev = Some(pt);
                 }
             }
-            let label = if playing {
-                if let Some(p) = &self.playing {
-                    let e = p.start.elapsed().as_secs_f32().min(p.seconds);
-                    format!("▶ {} / {}", fmt_dur(e), c.duration_label())
-                } else {
-                    c.duration_label()
-                }
+            let label = if let Some(p) = playing {
+                let e = p.start.elapsed().as_secs_f32().min(p.seconds);
+                format!("▶ {} / {}", fmt_dur(e), c.duration_label())
             } else {
                 c.duration_label()
             };
@@ -2164,13 +2219,86 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.vec_tex.remove(&id);
             }
             PanelAction::PlayPause => {
-                vm.playing = !vm.playing;
+                toggle_vector(&mut self.doc.data.vectors, id);
                 self.vec_tex.remove(&id);
             }
             PanelAction::Fill => {
                 vm.filled = !vm.filled;
                 self.vec_tex.remove(&id);
             }
+        }
+    }
+
+    // ================= playback modes =================
+    // `P` toggles the selected object (vector animation or voice clip);
+    // `Shift+P` toggles global perform mode (everything plays at once).
+
+    /// `P`: toggle playback of the selected vector/clip. Falls back to the
+    /// legacy pencil-tool shortcut when nothing playable is selected.
+    fn toggle_selection_playback(&mut self) {
+        match playback_target(self.selection) {
+            PlayTarget::Vector(id) => {
+                toggle_vector(&mut self.doc.data.vectors, id);
+                self.vec_tex.remove(&id);
+            }
+            PlayTarget::Clip(id) => self.toggle_play(id),
+            PlayTarget::None => self.set_tool(UiTool::Pencil),
+        }
+    }
+
+    fn toggle_perform(&mut self) {
+        if self.perform.is_active() {
+            self.exit_perform();
+        } else {
+            self.enter_perform();
+        }
+    }
+
+    fn enter_perform(&mut self) {
+        let any_anim = self.doc.data.vectors.iter().any(|v| v.anim.animated());
+        let any_clip = !self.doc.data.clips.is_empty();
+        if !any_anim && !any_clip {
+            self.toast("nothing to perform");
+            return;
+        }
+        self.perform.enter(&mut self.doc.data.vectors);
+        self.perform_paused = false;
+        // every audio clip starts playing (quiet: no toast spam)
+        let ids: Vec<u64> = self.doc.data.clips.iter().map(|c| c.id).collect();
+        for id in ids {
+            let _ = self.start_clip(id);
+        }
+    }
+
+    fn exit_perform(&mut self) {
+        self.perform.exit(&mut self.doc.data.vectors);
+        self.playing.clear(); // Esc stops all audio
+        self.perform_paused = false;
+    }
+
+    /// Space inside perform mode: pause (freeze) or resume.
+    fn toggle_perform_pause(&mut self) {
+        if !self.perform.is_active() {
+            return;
+        }
+        if self.perform_paused {
+            // resume: vectors keep their flags (frame loop re-advances),
+            // audio restarts from the top of each clip
+            let ids: Vec<u64> = self.doc.data.clips.iter().map(|c| c.id).collect();
+            for id in ids {
+                let _ = self.start_clip(id);
+            }
+            self.perform_paused = false;
+        } else {
+            self.playing.clear();
+            self.perform_paused = true;
+        }
+    }
+
+    fn perform_action(&mut self, act: PerformAction) {
+        match act {
+            PerformAction::TogglePause => self.toggle_perform_pause(),
+            PerformAction::Exit => self.exit_perform(),
         }
     }
 
@@ -2828,6 +2956,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             self.canvas.fill_rect(r)?;
             self.draw_top_icon(i as u8, r, INK)?;
         }
+        // perform-mode transport button (shift+P)
+        let pr = self.perform_button_rect();
+        self.button(pr, "▶", self.perform.is_active())?;
+        self.draw_label("perform", DIM, pr.x() + 8, pr.y() + 32)?;
         self.button(SdlRect::new(w - 76, 8, 64, 28), "?", self.show_help)?;
         // left toolbar
         self.cc(CHROME);
@@ -2985,13 +3117,17 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         }
         if SdlRect::new(w - 76, 8, 64, 28).contains_point((sx, sy)) {
             self.show_help = !self.show_help;
+            return;
+        }
+        if self.perform_button_rect().contains_point((sx, sy)) {
+            self.toggle_perform();
         }
     }
 
     fn draw_help(&mut self) -> Result<(), String> {
         let (w, h) = (self.win_w as i32, self.win_h as i32);
         let bw = 480;
-        let bh = 740;
+        let bh = 780;
         let bx = (w - bw) / 2;
         let by = (h - bh) / 2;
         self.canvas.set_draw_color(Color::RGBA(10, 10, 14, 230));
@@ -3002,7 +3138,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "MURAL — shortcuts",
             "",
             "V move/select   H pan (or space / mid-drag)",
-            "P pencil  N pen  M marker  O oil stick  K charcoal  S smudge",
+            "P play selected vector/clip (else pencil)  N pen  M marker  O oil  K charcoal  S smudge",
             "T text: click = point text, drag = text box",
             "text box panel: shape (no/rect/oval), align, size",
             "drag box corners to resize; double-click to re-edit",
@@ -3010,6 +3146,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "I import folder   drag & drop works too",
             "A record voice clip (12kHz μ-law 96kbps); A again = stop, esc = cancel",
             "V + click a clip to select; double-click or space = play; del removes",
+            "shift+P perform: all vectors + clips play; space pause; esc exits",
             "right-click a color swatch to edit it; BG edits canvas",
             "C cycles color set (Studio/Dutch/Pop/Picasso/Basquiat); shift+C = back",
             "del remove selected   esc deselect",
@@ -3032,6 +3169,31 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             }
             y += 28;
         }
+        Ok(())
+    }
+
+    /// Slim transport overlay shown during perform mode: pause/resume + exit.
+    fn draw_perform_bar(&mut self) -> Result<(), String> {
+        self.perform_hits.clear();
+        if !self.perform.is_active() {
+            return Ok(());
+        }
+        let w = self.win_w as i32;
+        let bw = 320;
+        let bx = (w - bw) / 2;
+        let by = TOP_H + 10;
+        self.canvas.set_draw_color(Color::RGBA(10, 10, 14, 235));
+        self.canvas.fill_rect(SdlRect::new(bx, by, bw as u32, 36))?;
+        self.canvas.set_draw_color(ACCENT);
+        self.canvas.draw_rect(SdlRect::new(bx, by, bw as u32, 36))?;
+        let label = if self.perform_paused { "PERFORM · paused" } else { "PERFORM" };
+        self.draw_label(label, ACCENT, bx + 14, by + 9)?;
+        let r1 = SdlRect::new(bx + bw - 148, by + 4, 64, 28);
+        self.button(r1, if self.perform_paused { ">" } else { "II" }, false)?;
+        self.perform_hits.push((r1, PerformAction::TogglePause));
+        let r2 = SdlRect::new(bx + bw - 76, by + 4, 64, 28);
+        self.button(r2, "exit", false)?;
+        self.perform_hits.push((r2, PerformAction::Exit));
         Ok(())
     }
 
@@ -3502,9 +3664,12 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     Event::KeyDown { keycode, keymod, repeat, .. } => {
                         if keycode == Some(Keycode::Space) {
                             self.space_down = true;
-                            // Space plays the selected clip (repeat-safe: never stops)
                             if !repeat {
-                                if let Some((SelKind::Clip, id)) = self.selection {
+                                if self.perform.is_active() {
+                                    // Space = pause/resume inside perform mode
+                                    self.toggle_perform_pause();
+                                } else if let Some((SelKind::Clip, id)) = self.selection {
+                                    // Space plays the selected clip (repeat-safe: never stops)
                                     self.play_clip_if_idle(id);
                                 }
                             }
@@ -3789,12 +3954,16 @@ fn main() -> Result<(), String> {
     let font_path = find_font().ok_or(
         "no TTF font found (tried DejaVu/Liberation/Noto; set MURAL_FONT=/path/to.ttf)",
     )?;
-    let window = video
+    let mut window = video
         .window("mural", 1280, 800)
         .position_centered()
         .resizable()
         .build()
         .map_err(|e| e.to_string())?;
+    // taskbar/dock icon (best effort: a missing file is not fatal)
+    if let Ok(icon) = sdl2::surface::Surface::load_bmp("assets/icon.bmp") {
+        window.set_icon(&icon);
+    }
     let canvas = window.into_canvas().present_vsync().build().map_err(|e| e.to_string())?;
     let (ww, wh) = canvas.output_size().unwrap_or((1280, 800));
     let tc = canvas.texture_creator();

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Mural
+Comment=infinite canvas drawing
+Exec=/home/hatch/workspace/your_files/mural/target/release/mural
+Icon=/home/hatch/workspace/your_files/mural/assets/icon-256.png
+Categories=Graphics;
+Terminal=false
+StartupNotify=false

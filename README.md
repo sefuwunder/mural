@@ -2,15 +2,17 @@
 
 Infinite canvas drawing app for desktop, in Rust + SDL2.
 
-Draw with four procedural brushes, pull in folders of images as movable
+Draw with six procedural brushes, pull in folders of images as movable
 reference, and drop text labels anywhere. Pan forever, zoom 0.1x–8x.
 
 ## Brushes
 
-- **Pencil** (P) — thin, graphite grain
+- **Pencil** — thin, graphite grain
 - **Pen** (N) — clean solid line
 - **Marker** (M) — thick, translucent alcohol-marker feel; overlaps darken
 - **Oil stick** (O) — chunky impasto with speckled texture
+- **Charcoal** (K) — vine-charcoal dust, paper-tooth grain
+- **Smudge** (S) — soft finger-smudge blending
 
 16 curated artist colors, per-brush size memory, `[` `]` or the slider to resize.
 
@@ -63,7 +65,8 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 | key | action |
 |---|---|
 | V / H | move · pan |
-| P N M O K S | pencil · pen · marker · oil stick · charcoal · smudge |
+| P | play selected vector/clip (pencil when nothing playable is selected) |
+| N M O K S | pen · marker · oil stick · charcoal · smudge |
 | T | text |
 | `[` `]` | brush size |
 | I | import folder |
@@ -75,6 +78,20 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 | ctrl+E | export PNG (content bounds) |
 | ctrl+0 | reset view |
 | F1 | this help |
+
+## Playback
+
+- **P** — toggle playback of the selected object: a vector's animation
+  (same as the panel play/pause button) or a voice clip's audio
+  (same as double-click); with nothing playable selected, P is the pencil
+- **Shift+P** (or the ▶ button in the top bar) — **perform mode**: every
+  animated vector starts playing and every voice clip starts sounding,
+  all at once. A slim transport overlay appears with pause/resume and exit.
+- **Space** in perform mode — pause / resume (audio restarts from the top)
+- **Esc** — exit perform mode: stops all audio and restores each vector's
+  pre-perform play/pause state
+- While performing, canvas editing is suspended — only transport keys
+  (and the overlay buttons) respond
 
 ## Command line
 
@@ -95,6 +112,19 @@ Press `:` for a vim-style command line (Enter runs, Esc cancels, ↑/↓ history
 Commands abbreviate vim-style (`:w :q :e :se :col :exp`).
 
 Layer order is fixed: images below paint below text.
+
+## Icon & assets
+
+`assets/` holds the app icon (gold impasto stroke on deep indigo):
+
+- `icon-master.webp` — 1600px master
+- `icon-{16,32,48,64,128,256}.png` — sized exports
+- `icon.bmp` — 64px BMP loaded at startup as the SDL window icon
+  (`assets/icon.bmp` must sit next to the working directory; missing file
+  is silently ignored)
+
+`mural.desktop` installs the app into desktop menus — adjust the `Exec`
+and `Icon` paths to your install location.
 
 ## Build
 
