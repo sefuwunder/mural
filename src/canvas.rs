@@ -95,6 +95,7 @@ pub enum ToolSer {
     Marker,
     OilStick,
     Charcoal,
+    Smudge,
 }
 
 impl From<Tool> for ToolSer {
@@ -105,6 +106,7 @@ impl From<Tool> for ToolSer {
             Tool::Marker => ToolSer::Marker,
             Tool::OilStick => ToolSer::OilStick,
             Tool::Charcoal => ToolSer::Charcoal,
+            Tool::Smudge => ToolSer::Smudge,
         }
     }
 }
@@ -116,6 +118,7 @@ impl From<ToolSer> for Tool {
             ToolSer::Marker => Tool::Marker,
             ToolSer::OilStick => Tool::OilStick,
             ToolSer::Charcoal => Tool::Charcoal,
+            ToolSer::Smudge => Tool::Smudge,
         }
     }
 }

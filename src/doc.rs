@@ -585,6 +585,20 @@ mod tests {
         assert_eq!(Tool::from(data.strokes[0].tool), Tool::Charcoal);
     }
     #[test]
+    fn smudge_stroke_roundtrip() {
+        // same as charcoal: the new ToolSer variant must survive save/load
+        let mut d = Doc::new();
+        d.add_stroke(Stroke { id: 10, tool: ToolSer::Smudge, color: 2, size: 24.0, points: vec![(0.0, 0.0), (30.0, 10.0)] });
+        let j = d.to_json().unwrap();
+        assert!(j.contains("\"Smudge\""), "smudge tool must serialize by name");
+        let data = Doc::from_json(&j).unwrap();
+        assert_eq!(data.strokes.len(), 1);
+        assert_eq!(data.strokes[0].tool, ToolSer::Smudge);
+        assert_eq!(Tool::from(data.strokes[0].tool), Tool::Smudge);
+        assert_eq!(Tool::Smudge.default_size(), 24.0);
+        assert!((Tool::Smudge.spacing() - 0.35).abs() < 1e-6);
+    }
+    #[test]
     fn color_set_switch_and_roundtrip() {
         let mut d = Doc::new();
         assert_eq!(d.data.color_set, 0);

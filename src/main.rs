@@ -9,7 +9,7 @@ mod palette;
 mod vector;
 
 use audio::{AudioClip, CLIP_RADIUS};
-use brush::{blit_stamp, box_blur_rgba, light_oil_region, stamp_height, walk_segment, TipCache, Tool};
+use brush::{blit_stamp, box_blur_rgba, light_oil_region, smudge_stroke, stamp_height, walk_segment, TipCache, Tool};
 use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, ToolSer, VectorMeta};
 use doc::Doc;
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
@@ -54,6 +54,7 @@ enum UiTool {
     Marker,
     OilStick,
     Charcoal,
+    Smudge,
     Text,
 }
 impl UiTool {
@@ -64,6 +65,7 @@ impl UiTool {
             UiTool::Marker => Some(Tool::Marker),
             UiTool::OilStick => Some(Tool::OilStick),
             UiTool::Charcoal => Some(Tool::Charcoal),
+            UiTool::Smudge => Some(Tool::Smudge),
             _ => None,
         }
     }
@@ -76,6 +78,7 @@ impl UiTool {
             UiTool::Marker => "M",
             UiTool::OilStick => "O",
             UiTool::Charcoal => "K",
+            UiTool::Smudge => "S",
             UiTool::Text => "T",
         }
     }
@@ -88,11 +91,12 @@ impl UiTool {
             UiTool::Marker => "Marker",
             UiTool::OilStick => "Oil",
             UiTool::Charcoal => "Charcoal",
+            UiTool::Smudge => "Smudge",
             UiTool::Text => "Text",
         }
     }
 }
-const TOOLS: [UiTool; 8] = [
+const TOOLS: [UiTool; 9] = [
     UiTool::Select,
     UiTool::Pan,
     UiTool::Pencil,
@@ -100,6 +104,7 @@ const TOOLS: [UiTool; 8] = [
     UiTool::Marker,
     UiTool::OilStick,
     UiTool::Charcoal,
+    UiTool::Smudge,
     UiTool::Text,
 ];
 
@@ -110,6 +115,7 @@ fn tool_index(t: UiTool) -> usize {
         UiTool::Marker => 2,
         UiTool::OilStick => 3,
         UiTool::Charcoal => 4,
+        UiTool::Smudge => 5,
         _ => 0,
     }
 }
@@ -273,7 +279,7 @@ struct App<'tc, 'ttf> {
     last_frame: Instant,
     tool: UiTool,
     color_idx: usize,
-    sizes: [f32; 5],
+    sizes: [f32; 6],
     selection: Option<(SelKind, u64)>,
     drag: DragKind,
     // drag state
@@ -379,7 +385,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             last_frame: Instant::now(),
             tool: UiTool::Pencil,
             color_idx: 0,
-            sizes: [Tool::Pencil.default_size(), Tool::Pen.default_size(), Tool::Marker.default_size(), Tool::OilStick.default_size(), Tool::Charcoal.default_size()],
+            sizes: [Tool::Pencil.default_size(), Tool::Pen.default_size(), Tool::Marker.default_size(), Tool::OilStick.default_size(), Tool::Charcoal.default_size(), Tool::Smudge.default_size()],
             selection: None,
             drag: DragKind::None,
             drag_sx: 0.0,
@@ -472,35 +478,63 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             };
             // (tile-local rect, raw RGBA8888 pixels) to blur+light after rasterizing
             let mut blur_jobs: Vec<(SdlRect, Vec<u8>)> = Vec::new();
+            // clear first: a tile holding only a smudge stroke still redraws
             canvas
                 .with_texture_canvas(tile, |c| {
                     c.set_draw_color(Color::RGBA(0, 0, 0, 0));
                     c.clear();
-                    // grease: melt oil-stroke edges into the canvas.
-                    // Deterministic — EVERY re-rasterize blurs ALL oil strokes
-                    // on the tile. (The old design blurred only newly-drawn
-                    // regions, but tiles redraw from scratch, so layering a new
-                    // stroke silently un-blurred older ones, leaving shifting
-                    // rectangular sharp/blurry patches.)
-                    let mut oil_rects: Vec<Rect> = Vec::new();
-                    for s in &doc.data.strokes {
-                        let b = s.bbox();
-                        if !b.intersects(&trect) {
-                            continue;
-                        }
-                        rasterize_stroke(
-                            c,
-                            tc,
-                            tips,
-                            s,
-                            origin,
-                            &doc.data.palette,
-                            height.as_mut().map(|v| &mut v[..]),
-                        );
-                        if s.tool == ToolSer::OilStick {
-                            oil_rects.push(b);
-                        }
-                    }
+                })
+                .expect("clear tile");
+            let mut oil_rects: Vec<Rect> = Vec::new();
+            // Strokes rasterize in order. Paint strokes go to the GPU in
+            // runs; each smudge stroke is applied on the CPU between runs
+            // (read the tile back, smear, write back), so it samples
+            // everything rasterized beneath it in stroke order — including
+            // its own earlier dabs — while strokes drawn after it still
+            // paint over it. Same stroke list -> same pixels, always.
+            let mut run: Vec<&Stroke> = Vec::new();
+            for s in &doc.data.strokes {
+                let b = s.bbox();
+                if !b.intersects(&trect) {
+                    continue;
+                }
+                if s.tool == ToolSer::Smudge {
+                    rasterize_paint_run(
+                        canvas,
+                        tc,
+                        tips,
+                        &mut *tile,
+                        &run,
+                        origin,
+                        &doc.data.palette,
+                        &mut height,
+                        &mut oil_rects,
+                    );
+                    run.clear();
+                    rasterize_smudge_stroke(canvas, &mut *tile, s, origin);
+                } else {
+                    run.push(s);
+                }
+            }
+            rasterize_paint_run(
+                canvas,
+                tc,
+                tips,
+                &mut *tile,
+                &run,
+                origin,
+                &doc.data.palette,
+                &mut height,
+                &mut oil_rects,
+            );
+            // grease: melt oil-stroke edges into the canvas.
+            // Deterministic — EVERY re-rasterize blurs ALL oil strokes
+            // on the tile. (The old design blurred only newly-drawn
+            // regions, but tiles redraw from scratch, so layering a new
+            // stroke silently un-blurred older ones, leaving shifting
+            // rectangular sharp/blurry patches.)
+            canvas
+                .with_texture_canvas(tile, |c| {
                     // grease: melt freshly rasterized oil edges into the canvas
                     for r in &union_rects(oil_rects) {
                         if !r.intersects(&trect) {
@@ -527,7 +561,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                         }
                     }
                 })
-                .expect("rasterize");
+                .expect("oil readback");
             for (xr, px) in blur_jobs {
                 let w = xr.width() as usize;
                 let h = xr.height() as usize;
@@ -550,6 +584,94 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             }
         }
     }
+}
+
+/// Rasterize one run of paint (non-smudge) strokes onto `tile`, in order.
+/// Collects oil bboxes for the grease pass; oil dabs deposit height.
+fn rasterize_paint_run<'tc>(
+    canvas: &mut Canvas<Window>,
+    tc: &'tc TextureCreator<WindowContext>,
+    tips: &mut TipCache<'tc>,
+    tile: &mut Texture<'tc>,
+    run: &[&Stroke],
+    origin: (f32, f32),
+    palette: &[[u8; 3]; 16],
+    height: &mut Option<Vec<u8>>,
+    oil_rects: &mut Vec<Rect>,
+) {
+    if run.is_empty() {
+        return;
+    }
+    canvas
+        .with_texture_canvas(tile, |c| {
+            for s in run {
+                rasterize_stroke(
+                    c,
+                    tc,
+                    tips,
+                    s,
+                    origin,
+                    palette,
+                    height.as_mut().map(|v| &mut v[..]),
+                );
+                if s.tool == ToolSer::OilStick {
+                    oil_rects.push(s.bbox());
+                }
+            }
+        })
+        .expect("rasterize run");
+}
+
+/// Apply one smudge stroke on the CPU: read back the tile region it
+/// touches, smear its dabs in stroke order over those pixels, write back.
+/// Each dab samples the tile as left by the earlier dabs (a finger drags
+/// its own smear). Readback failures are non-fatal — the stroke is skipped
+/// for this pass (same policy as the oil blur). The region is clamped to
+/// the tile, and the dab kernel bounds-checks every access, so off-tile
+/// dabs can never read or write out of bounds.
+fn rasterize_smudge_stroke(
+    canvas: &mut Canvas<Window>,
+    tile: &mut Texture,
+    s: &Stroke,
+    origin: (f32, f32),
+) {
+    let b = s.bbox();
+    // bbox already expands by the full dab diameter; pad one more pixel
+    // for float safety, then clamp to the tile
+    let rx0 = (b.x0 - origin.0 - 1.0).max(0.0) as i32;
+    let ry0 = (b.y0 - origin.1 - 1.0).max(0.0) as i32;
+    let rx1 = ((b.x1 - origin.0 + 1.0).min(TILE_PX)).ceil() as i32;
+    let ry1 = ((b.y1 - origin.1 + 1.0).min(TILE_PX)).ceil() as i32;
+    if rx1 <= rx0 || ry1 <= ry0 {
+        return;
+    }
+    let xr = SdlRect::new(rx0, ry0, (rx1 - rx0) as u32, (ry1 - ry0) as u32);
+    // read back the tile region; failures are non-fatal (same policy as
+    // the oil blur) — the stroke is skipped for this pass
+    let mut px: Option<Vec<u8>> = None;
+    canvas
+        .with_texture_canvas(tile, |c| {
+            if let Ok(p) = c.read_pixels(xr, PixelFormatEnum::RGBA8888) {
+                px = Some(p);
+            }
+        })
+        .expect("smudge readback");
+    let mut px = match px {
+        Some(p) => p,
+        None => return,
+    };
+    let (w, h) = (xr.width() as usize, xr.height() as usize);
+    if px.len() != w * h * 4 {
+        return;
+    }
+    // dabs in region-local coords; the buffer evolves dab by dab
+    let pts: Vec<(f32, f32)> = s
+        .points
+        .iter()
+        .map(|&(x, y)| (x - origin.0 - rx0 as f32, y - origin.1 - ry0 as f32))
+        .collect();
+    smudge_stroke(&mut px, w, h, &pts, s.size);
+    let _ = tile.update(xr, &px, w * 4);
 }
 
 fn rasterize_stroke<'a>(
@@ -1123,6 +1245,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             Some(Keycode::M) if !ctrl => self.set_tool(UiTool::Marker),
             Some(Keycode::O) if !ctrl => self.set_tool(UiTool::OilStick),
             Some(Keycode::K) if !ctrl => self.set_tool(UiTool::Charcoal),
+            Some(Keycode::S) if !ctrl => self.set_tool(UiTool::Smudge),
             Some(Keycode::T) if !ctrl => self.set_tool(UiTool::Text),
             Some(Keycode::I) if !ctrl => {
                 self.import_buf = Some(String::new());
@@ -1953,7 +2076,13 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let (w, h) = (self.win_w as f32, self.win_h as f32);
         let dpx = (st.size * cam.zoom).max(2.0) as u32;
         // borrow juggling: get tip, then stamp
-        let col = self.pal(st.color);
+        // smudge ignores the paint color (a finger, not a brush): preview it
+        // as a neutral gray ghost so the stroke doesn't promise paint
+        let col = if st.tool == Tool::Smudge {
+            Color::RGB(200, 200, 200)
+        } else {
+            self.pal(st.color)
+        };
         let tc = self.tc;
         let tips = &mut self.tips;
         let canvas = &mut self.canvas;
@@ -2327,6 +2456,15 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.fill_circ(cx + 11, cy + 10, 1)?;
                 self.fill_circ(cx - 1, cy - 12, 1)?;
             }
+            UiTool::Smudge => {
+                // finger smear: soft blob with trailing streaks
+                self.fill_circ(cx + 4, cy - 2, 7)?;
+                self.fill_circ(cx - 4, cy + 2, 5)?;
+                self.fill_circ(cx - 10, cy + 5, 3)?;
+                self.canvas.draw_line((cx - 11, cy - 8), (cx - 2, cy - 8))?;
+                self.canvas.draw_line((cx - 12, cy - 4), (cx - 5, cy - 4))?;
+                self.canvas.draw_line((cx - 11, cy + 11), (cx - 4, cy + 11))?;
+            }
             UiTool::Text => {
                 self.draw_label("A", fg, cx - 8, cy - 11)?;
             }
@@ -2564,7 +2702,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "MURAL — shortcuts",
             "",
             "V move/select   H pan (or space / mid-drag)",
-            "P pencil  N pen  M marker  O oil stick  K charcoal",
+            "P pencil  N pen  M marker  O oil stick  K charcoal  S smudge",
             "T text: click = point text, drag = text box",
             "text box panel: shape (no/rect/oval), align, size",
             "drag box corners to resize; double-click to re-edit",
@@ -3042,7 +3180,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
 
     /// Headless self-test: synthetic strokes/text/image, then export.
     fn smoke(&mut self) -> Result<(), String> {
-        for (i, tool) in [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick, Tool::Charcoal].iter().enumerate() {
+        for (i, tool) in [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick, Tool::Charcoal, Tool::Smudge].iter().enumerate() {
             let id = self.doc.alloc_id();
             let y = i as f32 * 110.0 - 165.0;
             let pts: Vec<(f32, f32)> = (0..48)

@@ -17,6 +17,7 @@ pub enum Tool {
     Marker,
     OilStick,
     Charcoal,
+    Smudge,
 }
 
 impl Tool {
@@ -26,6 +27,7 @@ impl Tool {
             Tool::Pencil | Tool::Pen => 0.35,
             Tool::Marker | Tool::Charcoal => 0.45,
             Tool::OilStick => 0.55,
+            Tool::Smudge => 0.35,
         }
     }
     pub fn default_size(self) -> f32 {
@@ -35,6 +37,7 @@ impl Tool {
             Tool::Marker => 22.0,
             Tool::OilStick => 30.0,
             Tool::Charcoal => 18.0,
+            Tool::Smudge => 24.0,
         }
     }
 }
@@ -97,13 +100,24 @@ pub fn make_tip<'a>(
                         // real oil stick (cf. reference swatch photos)
                         a *= 0.88 + 0.12 * hash01((x as f32 / 2.0) as i32, y as i32, 101);
                     }
+                    Tool::Smudge => {
+                        // live-preview ghost only: the real smudge is
+                        // computed on the CPU at rasterize time (see
+                        // smudge_stroke). A soft radial dab reads as "smear".
+                        let body = (1.0 - dist.powf(1.6)).clamp(0.0, 1.0);
+                        a = body.powf(1.2) * 0.5;
+                    }
                     Tool::Charcoal => {
                         // vine charcoal: powdery and grainy, catching the
                         // paper tooth — pigment sits on the highs and skips
                         // the lows, like real charcoal on textured paper.
-                        // coarse grain cells + ragged crumbly edge.
+                        // fine grain cells (1.5px) + a 1px dust speckle +
+                        // ragged crumbly edge.
                         let tooth =
-                            hash01((x as f32 / 3.0) as i32, (y as f32 / 3.0) as i32, 7);
+                            hash01((x as f32 / 1.5) as i32, (y as f32 / 1.5) as i32, 7);
+                        // second, finer speckle layer: per-pixel dust jitter,
+                        // kept subtle so it reads as scatter, not uniform noise
+                        let dust = hash01(x as i32, y as i32, 21);
                         // ragged edge: effective radius wobbles with angle
                         let theta = (y as f32 + 0.5 - r).atan2(x as f32 + 0.5 - r);
                         let wobble = 0.86 + 0.14 * hash01((theta * 5.0) as i32, 11, 8);
@@ -112,9 +126,13 @@ pub fn make_tip<'a>(
                         a = body.powf(0.9) * 0.92;
                         // paper tooth: pigment on highs, skip lows
                         a *= 0.22 + 0.78 * tooth.powf(1.6);
-                        // occasional dark clumps where the stick crumbles
-                        if hash01(x as i32, y as i32, 9) < 0.05 {
-                            a = (a * 1.2).min(1.0);
+                        // fine dust speckle
+                        a *= 0.92 + 0.08 * dust;
+                        // crumbled clumps: slightly more frequent, and each
+                        // particle varies in strength (1.1x..1.6x) so the
+                        // scatter reads natural instead of stamped
+                        if hash01(x as i32, y as i32, 9) < 0.07 {
+                            a = (a * (1.1 + 0.5 * hash01(x as i32, y as i32, 22))).min(1.0);
                         }
                     }
                 }
@@ -334,6 +352,94 @@ pub fn stamp_height(buf: &mut [u8], w: usize, x: f32, y: f32, diameter: f32) {
     }
 }
 
+/// Smudge dab strength: how strongly one dab drags the sampled color.
+/// Moderate — a finger smears paint, it doesn't paint over it.
+pub const SMUDGE_ALPHA: f32 = 0.35;
+
+/// Sample-and-smear one smudge dab into a straight-alpha RGBA8888 buffer
+/// (`w` x `h` pixels). The dab samples the pixel nearest `(x, y)` and
+/// stamps a soft radial dab of that color back into the buffer, so a drag
+/// smears paint — including the smear left by its own earlier dabs.
+///
+/// Pure and deterministic: same buffer + same dabs -> same bytes, which is
+/// what keeps tile re-rasterization (and undo/redo) stable. Never reads or
+/// writes out of bounds; dabs centered off the buffer are skipped entirely.
+/// Sampling a fully transparent pixel is a no-op — a finger on bare canvas
+/// moves nothing.
+///
+/// Note: unlike every other tool, smudge ignores the selected paint color
+/// (a finger, not a brush); the "color" always comes from the canvas.
+pub fn smudge_dab(buf: &mut [u8], w: usize, h: usize, x: f32, y: f32, radius: f32, alpha: f32) {
+    if buf.len() != w * h * 4 || w == 0 || h == 0 || radius <= 0.0 || alpha <= 0.0 {
+        return;
+    }
+    let sx = x.round() as i32;
+    let sy = y.round() as i32;
+    if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 {
+        return;
+    }
+    let si = (sy as usize * w + sx as usize) * 4;
+    if buf[si + 3] == 0 {
+        return; // nothing to drag
+    }
+    let (sr, sg, sb) = (buf[si] as f32, buf[si + 1] as f32, buf[si + 2] as f32);
+    let ri = radius.ceil() as i32;
+    for oy in -ri..=ri {
+        let py = sy + oy;
+        if py < 0 || py >= h as i32 {
+            continue;
+        }
+        for ox in -ri..=ri {
+            let px = sx + ox;
+            if px < 0 || px >= w as i32 {
+                continue;
+            }
+            let dx = px as f32 + 0.5 - x;
+            let dy = py as f32 + 0.5 - y;
+            let dist = (dx * dx + dy * dy).sqrt() / radius;
+            if dist >= 1.0 {
+                continue;
+            }
+            // soft radial falloff, slightly tighter than linear so the
+            // smear has a soft core instead of a hard disc edge
+            let a = (1.0 - dist).powf(1.5) * alpha;
+            if a <= 0.0 {
+                continue;
+            }
+            let o = (py as usize * w + px as usize) * 4;
+            let da = buf[o + 3] as f32 / 255.0;
+            let out_a = a + da * (1.0 - a);
+            if out_a > 1e-6 {
+                let ia = 1.0 - a;
+                buf[o] = ((sr * a + buf[o] as f32 * da * ia) / out_a).round().clamp(0.0, 255.0) as u8;
+                buf[o + 1] = ((sg * a + buf[o + 1] as f32 * da * ia) / out_a).round().clamp(0.0, 255.0) as u8;
+                buf[o + 2] = ((sb * a + buf[o + 2] as f32 * da * ia) / out_a).round().clamp(0.0, 255.0) as u8;
+            }
+            buf[o + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// Run a whole smudge stroke's dabs over `buf` in order: each dab samples
+/// the buffer as left by the earlier dabs, so the stroke drags its own
+/// smear. `points` are in buffer-pixel space; `size` is the dab diameter
+/// in the same units. Dab spacing matches the tool's stamp spacing.
+pub fn smudge_stroke(buf: &mut [u8], w: usize, h: usize, points: &[(f32, f32)], size: f32) {
+    let d = size.max(2.0);
+    let radius = (d / 2.0).max(1.0);
+    let mut dab = |x: f32, y: f32| smudge_dab(buf, w, h, x, y, radius, SMUDGE_ALPHA);
+    if points.len() == 1 {
+        let (x, y) = points[0];
+        dab(x, y);
+        return;
+    }
+    for pair in points.windows(2) {
+        let (x0, y0) = pair[0];
+        let (x1, y1) = pair[1];
+        walk_segment(x0, y0, x1, y1, d, Tool::Smudge.spacing(), |x, y, _| dab(x, y));
+    }
+}
+
 /// Thickness-dependent oil lighting, in place over an RGBA8888 region.
 /// Reads relief from a u8 heightmap: ridges catch a specular highlight and
 /// shade via the surface normal, valleys darken, thin washes (low height)
@@ -431,7 +537,7 @@ mod tests {
     use super::*;
     #[test]
     fn tool_spacing_sane() {
-        for t in [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick, Tool::Charcoal] {
+        for t in [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick, Tool::Charcoal, Tool::Smudge] {
             assert!(t.spacing() > 0.0 && t.spacing() < 1.0);
             assert!(t.default_size() > 0.0);
         }
@@ -531,6 +637,91 @@ mod tests {
         // off-tile dabs must not panic or write OOB
         stamp_height(&mut buf, 32, -50.0, -50.0, 20.0);
         stamp_height(&mut buf, 32, 500.0, 500.0, 20.0);
+    }
+    #[test]
+    fn smudge_deterministic() {
+        // same buffer + same stroke -> byte-identical output (re-rasterize stability)
+        let mk = || {
+            let mut b = vec![0u8; 64 * 64 * 4];
+            for y in 0..64 {
+                for x in 0..64 {
+                    let o = (y * 64 + x) * 4;
+                    b[o] = x as u8 * 4;
+                    b[o + 1] = y as u8 * 4;
+                    b[o + 2] = 128;
+                    b[o + 3] = 255;
+                }
+            }
+            b
+        };
+        let pts: Vec<(f32, f32)> = vec![(8.0, 8.0), (40.0, 30.0), (55.0, 50.0)];
+        let mut a = mk();
+        let mut b = mk();
+        smudge_stroke(&mut a, 64, 64, &pts, 24.0);
+        smudge_stroke(&mut b, 64, 64, &pts, 24.0);
+        assert_eq!(a, b, "smudge must rasterize deterministically");
+    }
+    #[test]
+    fn smudge_drags_color_into_empty() {
+        // left half solid red, right half transparent: smudging across the
+        // boundary must drag redness rightward with partial alpha
+        let (w, h) = (64, 32);
+        let mut buf = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w / 2 {
+                let o = (y * w + x) * 4;
+                buf[o] = 255;
+                buf[o + 3] = 255;
+            }
+        }
+        smudge_stroke(&mut buf, w, h, &[(20.0, 16.0), (44.0, 16.0)], 20.0);
+        // just right of the boundary: red dragged in, soft alpha
+        let o = (16 * w + 33) * 4;
+        assert!(buf[o] > 200, "red must be dragged across, got {}", buf[o]);
+        assert!(buf[o + 3] > 4 && buf[o + 3] < 255, "dragged smear is partial alpha");
+        // deep in the red half: still solid red
+        let o2 = (16 * w + 8) * 4;
+        assert_eq!((buf[o2], buf[o2 + 3]), (255, 255));
+        // far corner untouched and still transparent
+        let o3 = (2 * w + 60) * 4;
+        assert_eq!(buf[o3 + 3], 0);
+    }
+    #[test]
+    fn smudge_transparent_is_noop() {
+        let mut buf = vec![0u8; 32 * 32 * 4];
+        smudge_stroke(&mut buf, 32, 32, &[(4.0, 4.0), (28.0, 28.0)], 16.0);
+        assert!(buf.iter().all(|&b| b == 0), "smudging bare canvas moves nothing");
+    }
+    #[test]
+    fn smudge_off_buffer_is_safe() {
+        // dabs centered off the buffer (or straddling the edge) must never
+        // panic or write OOB — same discipline as the off-tile dab test
+        let mut buf = vec![0u8; 32 * 32 * 4];
+        for i in 0..buf.len() {
+            buf[i] = 200;
+        }
+        smudge_stroke(&mut buf, 32, 32, &[(-60.0, -60.0), (500.0, 500.0)], 24.0);
+        smudge_dab(&mut buf, 32, 32, -10.0, 16.0, 12.0, 0.35);
+        smudge_dab(&mut buf, 32, 32, 30.5, 16.0, 12.0, 0.35); // straddles edge
+        assert_eq!(buf.len(), 32 * 32 * 4);
+        // degenerate inputs are safe no-ops
+        let mut empty: Vec<u8> = vec![];
+        smudge_dab(&mut empty, 0, 0, 0.0, 0.0, 4.0, 0.35);
+        let mut wrong = vec![0u8; 10];
+        smudge_dab(&mut wrong, 4, 4, 1.0, 1.0, 4.0, 0.35);
+        assert_eq!(wrong.len(), 10);
+    }
+    #[test]
+    fn smudge_single_dab() {
+        // one dab on solid blue: center stays blue, alpha logic sane
+        let mut buf = vec![0u8; 16 * 16 * 4];
+        for o in (0..buf.len()).step_by(4) {
+            buf[o + 2] = 255;
+            buf[o + 3] = 255;
+        }
+        let before = buf.clone();
+        smudge_stroke(&mut buf, 16, 16, &[(8.0, 8.0)], 10.0);
+        assert_eq!(buf, before, "smudging a uniform field changes nothing visible");
     }
     #[test]
     fn light_oil_flat_height_is_identity() {
