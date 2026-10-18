@@ -76,6 +76,24 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 | ctrl+0 | reset view |
 | F1 | this help |
 
+## Command line
+
+Press `:` for a vim-style command line (Enter runs, Esc cancels, ↑/↓ history):
+
+| command | action |
+|---|---|
+| `:w [path]` | save `mural.json` (current file or given path) |
+| `:q` / `:q!` | quit — refuses when dirty unless `:q!` |
+| `:e <path>` | open a `mural.json` file |
+| `:tool <name>` | switch brush — `pencil pen marker oil charcoal smudge` (unique prefixes ok) |
+| `:set <prop>[=v]` | get/set tool props: `size`, `spacing` (per-tool), `color` (global); `+=` / `-=` work |
+| `:color <n>` | set palette color index |
+| `:export <path.png>` | PNG export of content bounds |
+| `:undo` / `:redo` | undo / redo |
+| `:help` | this help |
+
+Commands abbreviate vim-style (`:w :q :e :se :col :exp`).
+
 Layer order is fixed: images below paint below text.
 
 ## Build

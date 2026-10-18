@@ -4,13 +4,15 @@
 mod audio;
 mod brush;
 mod canvas;
+mod cmd;
 mod doc;
 mod palette;
 mod vector;
 
 use audio::{AudioClip, CLIP_RADIUS};
-use brush::{blit_stamp, box_blur_rgba, light_oil_region, smudge_stroke, stamp_height, walk_segment, TipCache, Tool};
+use brush::{blit_stamp, box_blur_rgba, clamp_brush_size, clamp_spacing, light_oil_region, smudge_stroke, stamp_height, walk_segment, TipCache, Tool};
 use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, ToolSer, VectorMeta};
+use cmd::{Command, ParseError, Prop, SetOp, SetVal, ToolName};
 use doc::Doc;
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
 use palette::{COUNT as PALETTE_COUNT, COLOR_SETS, PAPER_DOT};
@@ -41,6 +43,7 @@ const BOT_H: i32 = 76;
 const CHROME: Color = Color::RGB(0x1e, 0x1e, 0x24);
 const CHROME2: Color = Color::RGB(0x2a, 0x2a, 0x32);
 const INK: Color = Color::RGB(0xe8, 0xe8, 0xee);
+const ERR: Color = Color::RGB(0xff, 0x70, 0x60);
 const DIM: Color = Color::RGB(0x9a, 0x9a, 0xa6);
 const ACCENT: Color = Color::RGB(0xff, 0xb0, 0x00);
 const SEL: Color = Color::RGB(0x4a, 0x9e, 0xd6);
@@ -120,6 +123,17 @@ fn tool_index(t: UiTool) -> usize {
     }
 }
 
+/// Compact float formatting for the command line (`24`, `0.35`).
+fn fmt_num(v: f32) -> String {
+    let s = format!("{v:.3}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-0" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 struct ActiveStroke {
     tool: Tool,
     color: usize,
@@ -136,6 +150,13 @@ struct TextEdit {
     bh: f32,
     buf: String,
     existing: Option<u64>, // text id being re-edited
+}
+
+/// Vim-style `:` command-line state. History lives on App so it survives
+/// across invocations; `hist` is the in-progress navigation cursor.
+struct CmdLine {
+    buf: String,
+    hist: Option<usize>,
 }
 
 /// SDL2 capture callback: appends 12 kHz S16 mono samples to a shared buffer.
@@ -280,6 +301,7 @@ struct App<'tc, 'ttf> {
     tool: UiTool,
     color_idx: usize,
     sizes: [f32; 6],
+    spacings: [f32; 6],
     selection: Option<(SelKind, u64)>,
     drag: DragKind,
     // drag state
@@ -298,6 +320,11 @@ struct App<'tc, 'ttf> {
     text_edit: Option<TextEdit>,
     import_buf: Option<String>,
     show_help: bool,
+    cmdline: Option<CmdLine>,
+    cmd_history: Vec<String>,
+    cmd_msg: Option<(String, bool, Instant)>, // (text, is_error, shown_at)
+    cmd_swallow_colon: bool,
+    saved_seq: u64, // doc.seq() at last save/load; `:q` refuses when they differ
     toast: Option<(String, Instant)>,
     start: Instant,
     last_click_at: Option<Instant>,
@@ -386,6 +413,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             tool: UiTool::Pencil,
             color_idx: 0,
             sizes: [Tool::Pencil.default_size(), Tool::Pen.default_size(), Tool::Marker.default_size(), Tool::OilStick.default_size(), Tool::Charcoal.default_size(), Tool::Smudge.default_size()],
+            spacings: [Tool::Pencil.spacing(), Tool::Pen.spacing(), Tool::Marker.spacing(), Tool::OilStick.spacing(), Tool::Charcoal.spacing(), Tool::Smudge.spacing()],
             selection: None,
             drag: DragKind::None,
             drag_sx: 0.0,
@@ -403,6 +431,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             text_edit: None,
             import_buf: None,
             show_help: false,
+            cmdline: None,
+            cmd_history: Vec::new(),
+            cmd_msg: None,
+            cmd_swallow_colon: false,
+            saved_seq: 0,
             toast: None,
             current_path: None,
             color_edit: None,
@@ -432,7 +465,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
     fn set_brush_size(&mut self, s: f32) {
         let i = tool_index(self.tool);
-        self.sizes[i] = s.clamp(1.0, 96.0);
+        self.sizes[i] = clamp_brush_size(s);
+    }
+    /// Per-tool stamp spacing, honoring the `:set spacing=` override.
+    fn brush_spacing(spacings: &[f32; 6], tool: Tool) -> f32 {
+        spacings[tool.index()]
     }
 
     // ---- paint tiles ----
@@ -452,6 +489,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let tips = &mut self.tips;
         let tiles = &mut self.tiles;
         let canvas = &mut self.canvas;
+        let spacings = self.spacings;
         for key in keys {
             let tile = tiles.entry(key).or_insert_with(|| {
                 let mut t = tc
@@ -509,9 +547,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                         &doc.data.palette,
                         &mut height,
                         &mut oil_rects,
+                        spacings,
                     );
                     run.clear();
-                    rasterize_smudge_stroke(canvas, &mut *tile, s, origin);
+                    rasterize_smudge_stroke(canvas, &mut *tile, s, origin, spacings[Tool::Smudge.index()]);
                 } else {
                     run.push(s);
                 }
@@ -526,6 +565,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 &doc.data.palette,
                 &mut height,
                 &mut oil_rects,
+                spacings,
             );
             // grease: melt oil-stroke edges into the canvas.
             // Deterministic — EVERY re-rasterize blurs ALL oil strokes
@@ -598,6 +638,7 @@ fn rasterize_paint_run<'tc>(
     palette: &[[u8; 3]; 16],
     height: &mut Option<Vec<u8>>,
     oil_rects: &mut Vec<Rect>,
+    spacings: [f32; 6],
 ) {
     if run.is_empty() {
         return;
@@ -613,6 +654,7 @@ fn rasterize_paint_run<'tc>(
                     origin,
                     palette,
                     height.as_mut().map(|v| &mut v[..]),
+                    spacings[Tool::from(s.tool).index()],
                 );
                 if s.tool == ToolSer::OilStick {
                     oil_rects.push(s.bbox());
@@ -634,6 +676,7 @@ fn rasterize_smudge_stroke(
     tile: &mut Texture,
     s: &Stroke,
     origin: (f32, f32),
+    spacing: f32, // per-tool stamp spacing override (App::spacings)
 ) {
     let b = s.bbox();
     // bbox already expands by the full dab diameter; pad one more pixel
@@ -670,7 +713,7 @@ fn rasterize_smudge_stroke(
         .iter()
         .map(|&(x, y)| (x - origin.0 - rx0 as f32, y - origin.1 - ry0 as f32))
         .collect();
-    smudge_stroke(&mut px, w, h, &pts, s.size);
+    smudge_stroke(&mut px, w, h, &pts, s.size, spacing);
     let _ = tile.update(xr, &px, w * 4);
 }
 
@@ -682,6 +725,7 @@ fn rasterize_stroke<'a>(
     origin: (f32, f32),
     pal: &[[u8; 3]; 16],
     height: Option<&mut [u8]>, // tile-local paint-thickness map (TILE_PX^2); oil dabs deposit here
+    spacing: f32, // per-tool stamp spacing override (App::spacings)
 ) {
     if s.points.is_empty() {
         return;
@@ -711,7 +755,7 @@ fn rasterize_stroke<'a>(
     for w in s.points.windows(2) {
         let (x0, y0) = w[0];
         let (x1, y1) = w[1];
-        walk_segment(x0, y0, x1, y1, s.size, tool.spacing(), |x, y, dd| {
+        walk_segment(x0, y0, x1, y1, s.size, spacing, |x, y, dd| {
             stamp(c, x, y, dd)
         });
     }
@@ -930,7 +974,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             self.ui_click(sx, sy);
             return;
         }
-        if self.text_edit.is_some() || self.import_buf.is_some() {
+        if self.text_edit.is_some() || self.import_buf.is_some() || self.cmdline.is_some() {
             return; // clicks while typing go nowhere (esc cancels)
         }
         let (wx, wy) = self.cam.screen_to_world(sx as f32, sy as f32, self.win_w as f32, self.win_h as f32);
@@ -1202,6 +1246,23 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let ctrl = keymod.contains(Mod::LCTRLMOD) || keymod.contains(Mod::RCTRLMOD);
         let shift = keymod.contains(Mod::LSHIFTMOD) || keymod.contains(Mod::RSHIFTMOD);
 
+        // --- command-line mode takes over the keyboard ---
+        if self.cmdline.is_some() {
+            match keycode {
+                Some(Keycode::Return) | Some(Keycode::KpEnter) => return self.exec_cmdline(video),
+                Some(Keycode::Escape) => self.cancel_cmdline(video),
+                Some(Keycode::Backspace) => {
+                    if let Some(c) = self.cmdline.as_mut() {
+                        c.buf.pop();
+                    }
+                }
+                Some(Keycode::Up) => self.cmd_hist_step(-1),
+                Some(Keycode::Down) => self.cmd_hist_step(1),
+                _ => {}
+            }
+            return true;
+        }
+
         // --- text entry modes take over the keyboard ---
         if self.import_buf.is_some() || self.text_edit.is_some() {
             match keycode {
@@ -1263,6 +1324,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             Some(Keycode::E) if ctrl => self.export_png(),
             Some(Keycode::O) if ctrl => self.load_doc(),
             Some(Keycode::Q) if ctrl => return false,
+            Some(Keycode::Semicolon) if shift && !ctrl => self.open_cmdline(video),
+            Some(Keycode::Colon) if !ctrl => self.open_cmdline(video),
             Some(Keycode::Equals) if ctrl => self.zoom_step(1.25),
             Some(Keycode::Minus) if ctrl => self.zoom_step(0.8),
             Some(Keycode::Num0) if ctrl => {
@@ -1276,6 +1339,19 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn on_text(&mut self, text: &str) {
+        if self.cmdline.is_some() {
+            // swallow the ":" that opened the line (it arrives as TextInput)
+            if self.cmd_swallow_colon {
+                self.cmd_swallow_colon = false;
+                if text == ":" {
+                    return;
+                }
+            }
+            if let Some(c) = self.cmdline.as_mut() {
+                c.buf.push_str(text);
+            }
+            return;
+        }
         if let Some(b) = self.import_buf.as_mut() {
             b.push_str(text);
         } else if let Some(e) = self.text_edit.as_mut() {
@@ -1339,6 +1415,219 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.import_buf = None;
         self.text_edit = None;
         video.text_input().stop();
+    }
+
+    // ================= vim-style `:` command line =================
+
+    fn open_cmdline(&mut self, video: &sdl2::VideoSubsystem) {
+        self.cmdline = Some(CmdLine { buf: String::new(), hist: None });
+        self.cmd_swallow_colon = true;
+        self.cmd_msg = None;
+        video.text_input().start();
+    }
+
+    fn cancel_cmdline(&mut self, video: &sdl2::VideoSubsystem) {
+        self.cmdline = None;
+        self.cmd_swallow_colon = false;
+        video.text_input().stop();
+    }
+
+    fn cmd_message(&mut self, msg: String, is_error: bool) {
+        if !msg.is_empty() {
+            self.cmd_msg = Some((msg, is_error, Instant::now()));
+        }
+    }
+
+    fn cmd_hist_step(&mut self, dir: i32) {
+        if self.cmd_history.is_empty() {
+            return;
+        }
+        let n = self.cmd_history.len();
+        let c = match self.cmdline.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+        let next = match c.hist {
+            None if dir < 0 => n - 1,
+            None => return,
+            Some(i) => {
+                let j = i as i32 + dir;
+                if j < 0 {
+                    return;
+                }
+                if j >= n as i32 {
+                    c.hist = None;
+                    c.buf.clear();
+                    return;
+                }
+                j as usize
+            }
+        };
+        c.hist = Some(next);
+        c.buf = self.cmd_history[next].clone();
+    }
+
+    /// Execute the command line. Returns false when the app should quit.
+    fn exec_cmdline(&mut self, video: &sdl2::VideoSubsystem) -> bool {
+        let line = self.cmdline.as_ref().map(|c| c.buf.clone()).unwrap_or_default();
+        let line = line.trim().to_string();
+        self.cmdline = None;
+        self.cmd_swallow_colon = false;
+        video.text_input().stop();
+        if !line.is_empty() && self.cmd_history.last().map(|h| h != &line).unwrap_or(true) {
+            self.cmd_history.push(line.clone());
+        }
+        let cmd = match cmd::parse(&line) {
+            Ok(c) => c,
+            Err(ParseError::Empty) => return true,
+            Err(e) => {
+                self.cmd_message(e.message(), true);
+                return true;
+            }
+        };
+        let (msg, is_error, quit) = self.run_command(cmd);
+        self.cmd_message(msg, is_error);
+        !quit
+    }
+
+    /// Run a parsed command. Returns (message, is_error, quit).
+    fn run_command(&mut self, cmd: Command) -> (String, bool, bool) {
+        match cmd {
+            Command::Write(path) => {
+                let p = path.map(PathBuf::from).unwrap_or_else(|| {
+                    self.current_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("mural.json"))
+                });
+                match self.save_to(&p) {
+                    Ok(m) => {
+                        self.saved_seq = self.doc.seq();
+                        (m, false, false)
+                    }
+                    Err(e) => (format!("E: {e}"), true, false),
+                }
+            }
+            Command::Quit { force } => {
+                if !force && self.doc.seq() != self.saved_seq {
+                    ("E: unsaved changes (use :q!)".to_string(), true, false)
+                } else {
+                    (String::new(), false, true)
+                }
+            }
+            Command::Edit(path) => match self.load_path(Path::new(&path)) {
+                Ok(m) => (m, false, false), // load_path snapshots saved_seq
+                Err(e) => (format!("E: {e}"), true, false),
+            },
+            Command::Tool(t) => {
+                let ui = match t {
+                    ToolName::Pencil => UiTool::Pencil,
+                    ToolName::Pen => UiTool::Pen,
+                    ToolName::Marker => UiTool::Marker,
+                    ToolName::OilStick => UiTool::OilStick,
+                    ToolName::Charcoal => UiTool::Charcoal,
+                    ToolName::Smudge => UiTool::Smudge,
+                };
+                self.set_tool(ui);
+                (format!("tool: {}", ui.label().to_lowercase()), false, false)
+            }
+            Command::Set { prop, op, value } => self.cmd_set(prop, op, value),
+            Command::Color(i) => {
+                self.color_idx = i.min(PALETTE_COUNT - 1);
+                (format!("color={}", self.color_idx), false, false)
+            }
+            Command::Export(path) => match self.render_export(&path) {
+                Ok(_) => (format!("exported {path}"), false, false),
+                Err(e) => (format!("E: {e}"), true, false),
+            },
+            Command::Undo => match self.doc.undo() {
+                Some(_) => {
+                    self.sync_media();
+                    self.selection = None;
+                    ("undo".to_string(), false, false)
+                }
+                None => ("nothing to undo".to_string(), false, false),
+            },
+            Command::Redo => match self.doc.redo() {
+                Some(_) => {
+                    self.sync_media();
+                    self.selection = None;
+                    ("redo".to_string(), false, false)
+                }
+                None => ("nothing to redo".to_string(), false, false),
+            },
+            Command::Help => {
+                self.show_help = true;
+                (String::new(), false, false)
+            }
+        }
+    }
+
+    /// `:set` get/set/+=/-= on tool properties.
+    fn cmd_set(&mut self, prop: Prop, op: SetOp, value: Option<SetVal>) -> (String, bool, bool) {
+        let fnum = |v: Option<SetVal>| -> Result<Option<f32>, String> {
+            match v {
+                None => Ok(None),
+                Some(SetVal::F(x)) => Ok(Some(x)),
+                Some(_) => Err("E: expected a number".to_string()),
+            }
+        };
+        let unum = |v: Option<SetVal>| -> Result<Option<usize>, String> {
+            match v {
+                None => Ok(None),
+                Some(SetVal::U(x)) => Ok(Some(x)),
+                Some(_) => Err("E: expected an integer".to_string()),
+            }
+        };
+        match prop {
+            Prop::Size => {
+                let v = match fnum(value) {
+                    Ok(v) => v,
+                    Err(e) => return (e, true, false),
+                };
+                let i = tool_index(self.tool);
+                let new = match (op, v) {
+                    (SetOp::Get, _) => self.sizes[i],
+                    (SetOp::Set, Some(x)) => x,
+                    (SetOp::Add, Some(x)) => self.sizes[i] + x,
+                    (SetOp::Sub, Some(x)) => self.sizes[i] - x,
+                    _ => return ("E: missing value".to_string(), true, false),
+                };
+                self.sizes[i] = clamp_brush_size(new);
+                (format!("size={}", fmt_num(self.sizes[i])), false, false)
+            }
+            Prop::Spacing => {
+                let v = match fnum(value) {
+                    Ok(v) => v,
+                    Err(e) => return (e, true, false),
+                };
+                let i = tool_index(self.tool);
+                let new = match (op, v) {
+                    (SetOp::Get, _) => self.spacings[i],
+                    (SetOp::Set, Some(x)) => x,
+                    (SetOp::Add, Some(x)) => self.spacings[i] + x,
+                    (SetOp::Sub, Some(x)) => self.spacings[i] - x,
+                    _ => return ("E: missing value".to_string(), true, false),
+                };
+                self.spacings[i] = clamp_spacing(new);
+                (format!("spacing={}", fmt_num(self.spacings[i])), false, false)
+            }
+            Prop::Color => {
+                let v = match unum(value) {
+                    Ok(v) => v,
+                    Err(e) => return (e, true, false),
+                };
+                match (op, v) {
+                    (SetOp::Get, _) => {}
+                    (SetOp::Set, Some(x)) => self.color_idx = x.min(PALETTE_COUNT - 1),
+                    (SetOp::Add, Some(x)) => {
+                        self.color_idx = (self.color_idx + x).min(PALETTE_COUNT - 1)
+                    }
+                    (SetOp::Sub, Some(x)) => self.color_idx = self.color_idx.saturating_sub(x),
+                    _ => return ("E: missing value".to_string(), true, false),
+                }
+                (format!("color={}", self.color_idx), false, false)
+            }
+        }
     }
 
 
@@ -1485,6 +1774,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             self.draw_help()?;
         }
         self.draw_import_bar()?;
+        self.draw_cmdline()?;
         self.draw_toast()?;
         self.canvas.present();
         Ok(())
@@ -2084,6 +2374,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             self.pal(st.color)
         };
         let tc = self.tc;
+        let spacing = Self::brush_spacing(&self.spacings, st.tool);
         let tips = &mut self.tips;
         let canvas = &mut self.canvas;
         let tip = tips.get(tc, st.tool, dpx).map_err(|e| e)?;
@@ -2092,7 +2383,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         for pair in scr.windows(2) {
             let (x0, y0) = pair[0];
             let (x1, y1) = pair[1];
-            walk_segment(x0, y0, x1, y1, st.size * cam.zoom, st.tool.spacing(), |x, y, dd| {
+            walk_segment(x0, y0, x1, y1, st.size * cam.zoom, spacing, |x, y, dd| {
                 let _ = blit_stamp(canvas, tip, x, y, dd);
             });
         }
@@ -2691,7 +2982,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn draw_help(&mut self) -> Result<(), String> {
         let (w, h) = (self.win_w as i32, self.win_h as i32);
         let bw = 480;
-        let bh = 600;
+        let bh = 740;
         let bx = (w - bw) / 2;
         let by = (h - bh) / 2;
         self.canvas.set_draw_color(Color::RGBA(10, 10, 14, 230));
@@ -2720,6 +3011,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "",
             "paint sits above images, text above paint",
             "",
+            ": command line — :w :q :e :tool :set :color :export :undo :redo :help",
+            ":set size|spacing|color[=v] — per-tool props; += / -= work",
+            "",
             "F1 closes this",
         ];
         let mut y = by + 18;
@@ -2728,6 +3022,34 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.draw_label(ln, if i == 0 { ACCENT } else { INK }, bx + 20, y)?;
             }
             y += 28;
+        }
+        Ok(())
+    }
+
+    /// Vim-style `:` command line + status/message bar, just above the
+    /// bottom chrome (same bar shows results and errors after execution).
+    fn draw_cmdline(&mut self) -> Result<(), String> {
+        let (w, h) = (self.win_w as i32, self.win_h as i32);
+        let y = h - BOT_H - 40;
+        if let Some(c) = &self.cmdline {
+            let buf = c.buf.clone();
+            self.canvas.set_draw_color(Color::RGBA(10, 10, 14, 235));
+            self.canvas.fill_rect(SdlRect::new(0, y, w as u32, 36))?;
+            self.canvas.set_draw_color(ACCENT);
+            self.canvas.draw_rect(SdlRect::new(0, y, w as u32, 36))?;
+            let prompt = format!(":{buf}");
+            self.draw_label(&prompt, INK, 12, y + 9)?;
+            // block cursor
+            let (tw, _) = self.font_ui.size_of(&prompt).unwrap_or((0, 0));
+            self.canvas.set_draw_color(ACCENT);
+            self.canvas
+                .fill_rect(SdlRect::new(12 + tw as i32 + 2, y + 7, 11, 22))?;
+        } else if let Some((msg, is_error, _)) = &self.cmd_msg {
+            let msg = msg.clone();
+            let col = if *is_error { ERR } else { INK };
+            self.canvas.set_draw_color(Color::RGBA(10, 10, 14, 235));
+            self.canvas.fill_rect(SdlRect::new(0, y, w as u32, 36))?;
+            self.draw_label(&msg, col, 12, y + 9)?;
         }
         Ok(())
     }
@@ -2970,20 +3292,28 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.toast(&format!("imported {} image{}", n, if n == 1 { "" } else { "s" }));
     }
 
+    /// Save to `path`, returning the status message (shared by Ctrl+S and `:w`).
+    fn save_to(&mut self, path: &Path) -> Result<String, String> {
+        let j = self
+            .doc
+            .to_json()
+            .map_err(|e| format!("save failed: {e}"))?;
+        std::fs::write(path, j).map_err(|e| format!("save failed: {e}"))?;
+        self.current_path = Some(path.to_path_buf());
+        Ok(format!("saved {}", path.display()))
+    }
+
     fn save_doc(&mut self) {
         let path = self
             .current_path
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("mural.json"));
-        match self.doc.to_json() {
-            Ok(j) => match std::fs::write(&path, j) {
-                Ok(_) => {
-                    self.current_path = Some(path.clone());
-                    self.toast(&format!("saved {}", path.display()));
-                }
-                Err(e) => self.toast(&format!("save failed: {}", e)),
-            },
-            Err(e) => self.toast(&format!("save failed: {}", e)),
+        match self.save_to(&path) {
+            Ok(m) => {
+                self.saved_seq = self.doc.seq();
+                self.toast(&m);
+            }
+            Err(e) => self.toast(&e),
         }
     }
 
@@ -2996,36 +3326,36 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             Some(p) => p,
             None => return, // cancelled (or no dialog backend available)
         };
-        self.load_path(&path);
+        match self.load_path(&path) {
+            Ok(m) => self.toast(&m),
+            Err(e) => self.toast(&e),
+        }
     }
 
-    fn load_path(&mut self, path: &std::path::Path) {
-        let s = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                self.toast(&format!("open failed: {}", e));
-                return;
+    /// Open `path`, returning the status message (shared by Ctrl+O and `:e`).
+    fn load_path(&mut self, path: &std::path::Path) -> Result<String, String> {
+        let s =
+            std::fs::read_to_string(path).map_err(|e| format!("open failed: {e}"))?;
+        let data = Doc::from_json(&s).map_err(|e| format!("open failed: {e}"))?;
+        let n_img = data.images.len();
+        self.doc.load_data(data);
+        self.tiles.clear();
+        self.img_tex.clear();
+        self.text_tex.clear();
+        self.sync_media();
+        let missing = n_img - self.img_tex.len();
+        self.selection = None;
+        self.current_path = Some(path.to_path_buf());
+        self.saved_seq = self.doc.seq();
+        Ok(format!(
+            "loaded {}{}",
+            path.display(),
+            if missing > 0 {
+                format!(" ({} images missing)", missing)
+            } else {
+                String::new()
             }
-        };
-        match Doc::from_json(&s) {
-            Ok(data) => {
-                let n_img = data.images.len();
-                self.doc.load_data(data);
-                self.tiles.clear();
-                self.img_tex.clear();
-                self.text_tex.clear();
-                self.sync_media();
-                let missing = n_img - self.img_tex.len();
-                self.selection = None;
-                self.current_path = Some(path.to_path_buf());
-                self.toast(&format!(
-                    "loaded {}{}",
-                    path.display(),
-                    if missing > 0 { format!(" ({} images missing)", missing) } else { String::new() }
-                ));
-            }
-            Err(e) => self.toast(&format!("open failed: {}", e)),
-        }
+        ))
     }
 
     fn export_png(&mut self) {
@@ -3171,6 +3501,12 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             if let Some((_, t)) = &self.toast {
                 if t.elapsed().as_secs() > 3 {
                     self.toast = None;
+                }
+            }
+            if let Some((_, is_error, t)) = &self.cmd_msg {
+                let ttl = if *is_error { 6 } else { 3 };
+                if t.elapsed().as_secs() > ttl {
+                    self.cmd_msg = None;
                 }
             }
             self.frame()?;
@@ -3345,7 +3681,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         // vectors key), a text, and an image whose file is missing
         let hostile = r#"{"strokes":[{"id":1,"tool":"Pen","color":0,"size":4.0,"points":[[0.0,0.0],[100.0,50.0]]}],"images":[{"id":2,"path":"/tmp/does_not_exist.png","x":10.0,"y":10.0,"w":200.0,"h":100.0}],"texts":[{"id":3,"text":"hello","x":5.0,"y":5.0,"w":60.0,"h":20.0,"color":1,"size":24.0}]}"#;
         std::fs::write("mural.json", hostile).expect("write mural.json");
-        self.load_path(std::path::Path::new("mural.json"));
+        self.load_path(std::path::Path::new("mural.json")).expect("hostile load");
         assert_eq!(self.doc.data.strokes.len(), 1, "strokes load");
         assert_eq!(self.doc.data.texts.len(), 1, "texts load");
         assert!(self.img_tex.is_empty(), "missing image must not load a texture");

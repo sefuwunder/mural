@@ -58,6 +58,7 @@ pub struct Doc {
     undo: Vec<Action>,
     redo: Vec<Action>,
     dirty: Vec<Rect>,     // paint-tile regions needing re-rasterization
+    seq: u64,             // increments on every mutating action; `:q` compares against the saved value
 }
 
 impl Doc {
@@ -73,6 +74,7 @@ impl Doc {
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: Vec::new(),
+            seq: 0,
         }
     }
     pub fn alloc_id(&mut self) -> u64 {
@@ -103,6 +105,12 @@ impl Doc {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.seq += 1;
+    }
+
+    /// Mutation counter for the `:q` unsaved-changes check.
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     // ---- strokes ----
@@ -653,6 +661,18 @@ mod tests {
         let mut d2 = Doc::new();
         d2.load_data(data);
         assert!(!d2.take_dirty().is_empty(), "loaded content must re-rasterize (oil blur included)");
+    }
+    #[test]
+    fn seq_counts_mutations() {
+        // `:q` uses seq() to detect unsaved changes
+        let mut d = Doc::new();
+        assert_eq!(d.seq(), 0);
+        d.add_stroke(stroke(1));
+        assert_eq!(d.seq(), 1);
+        d.add_stroke(stroke(2));
+        assert_eq!(d.seq(), 2);
+        d.undo(); // undo is not a new mutation
+        assert_eq!(d.seq(), 2);
     }
     #[test]
     fn undo_redo_stroke() {

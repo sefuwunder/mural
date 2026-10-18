@@ -30,6 +30,17 @@ impl Tool {
             Tool::Smudge => 0.35,
         }
     }
+    /// index into App's per-tool property arrays (sizes, spacings)
+    pub fn index(self) -> usize {
+        match self {
+            Tool::Pencil => 0,
+            Tool::Pen => 1,
+            Tool::Marker => 2,
+            Tool::OilStick => 3,
+            Tool::Charcoal => 4,
+            Tool::Smudge => 5,
+        }
+    }
     pub fn default_size(self) -> f32 {
         match self {
             Tool::Pencil => 3.0,
@@ -40,6 +51,16 @@ impl Tool {
             Tool::Smudge => 24.0,
         }
     }
+}
+
+/// Clamp a brush size to the UI range (mirrors App::set_brush_size).
+pub fn clamp_brush_size(s: f32) -> f32 {
+    s.clamp(1.0, 96.0)
+}
+
+/// Clamp a stamp-spacing fraction to a sane range.
+pub fn clamp_spacing(s: f32) -> f32 {
+    s.clamp(0.05, 1.0)
 }
 
 fn hash01(x: i32, y: i32, seed: u32) -> f32 {
@@ -423,8 +444,9 @@ pub fn smudge_dab(buf: &mut [u8], w: usize, h: usize, x: f32, y: f32, radius: f3
 /// Run a whole smudge stroke's dabs over `buf` in order: each dab samples
 /// the buffer as left by the earlier dabs, so the stroke drags its own
 /// smear. `points` are in buffer-pixel space; `size` is the dab diameter
-/// in the same units. Dab spacing matches the tool's stamp spacing.
-pub fn smudge_stroke(buf: &mut [u8], w: usize, h: usize, points: &[(f32, f32)], size: f32) {
+/// in the same units. `spacing` is the stamp spacing as a fraction of the
+/// dab diameter (App threads its per-tool override through here).
+pub fn smudge_stroke(buf: &mut [u8], w: usize, h: usize, points: &[(f32, f32)], size: f32, spacing: f32) {
     let d = size.max(2.0);
     let radius = (d / 2.0).max(1.0);
     let mut dab = |x: f32, y: f32| smudge_dab(buf, w, h, x, y, radius, SMUDGE_ALPHA);
@@ -436,7 +458,7 @@ pub fn smudge_stroke(buf: &mut [u8], w: usize, h: usize, points: &[(f32, f32)], 
     for pair in points.windows(2) {
         let (x0, y0) = pair[0];
         let (x1, y1) = pair[1];
-        walk_segment(x0, y0, x1, y1, d, Tool::Smudge.spacing(), |x, y, _| dab(x, y));
+        walk_segment(x0, y0, x1, y1, d, spacing, |x, y, _| dab(x, y));
     }
 }
 
@@ -541,6 +563,32 @@ mod tests {
             assert!(t.spacing() > 0.0 && t.spacing() < 1.0);
             assert!(t.default_size() > 0.0);
         }
+    }
+    #[test]
+    fn tool_index_covers_all_tools() {
+        // order must match main.rs tool_index (Pencil..Smudge = 0..5)
+        let tools = [Tool::Pencil, Tool::Pen, Tool::Marker, Tool::OilStick, Tool::Charcoal, Tool::Smudge];
+        for (i, t) in tools.iter().enumerate() {
+            assert_eq!(t.index(), i);
+        }
+    }
+    #[test]
+    fn clamp_helpers() {
+        assert_eq!(clamp_brush_size(0.0), 1.0);
+        assert_eq!(clamp_brush_size(500.0), 96.0);
+        assert_eq!(clamp_brush_size(24.0), 24.0);
+        assert_eq!(clamp_spacing(0.0), 0.05);
+        assert_eq!(clamp_spacing(2.0), 1.0);
+        assert_eq!(clamp_spacing(0.35), 0.35);
+    }
+    #[test]
+    fn tighter_spacing_means_more_dabs() {
+        // the per-tool spacing override must actually change stamp density
+        let mut wide = vec![];
+        walk_segment(0.0, 0.0, 200.0, 0.0, 20.0, 0.5, |x, y, _| wide.push((x, y)));
+        let mut tight = vec![];
+        walk_segment(0.0, 0.0, 200.0, 0.0, 20.0, 0.25, |x, y, _| tight.push((x, y)));
+        assert!(tight.len() > wide.len() * 3 / 2, "tight={} wide={}", tight.len(), wide.len());
     }
     #[test]
     fn walk_segment_covers_endpoints() {
@@ -657,8 +705,8 @@ mod tests {
         let pts: Vec<(f32, f32)> = vec![(8.0, 8.0), (40.0, 30.0), (55.0, 50.0)];
         let mut a = mk();
         let mut b = mk();
-        smudge_stroke(&mut a, 64, 64, &pts, 24.0);
-        smudge_stroke(&mut b, 64, 64, &pts, 24.0);
+        smudge_stroke(&mut a, 64, 64, &pts, 24.0, Tool::Smudge.spacing());
+        smudge_stroke(&mut b, 64, 64, &pts, 24.0, Tool::Smudge.spacing());
         assert_eq!(a, b, "smudge must rasterize deterministically");
     }
     #[test]
@@ -674,7 +722,7 @@ mod tests {
                 buf[o + 3] = 255;
             }
         }
-        smudge_stroke(&mut buf, w, h, &[(20.0, 16.0), (44.0, 16.0)], 20.0);
+        smudge_stroke(&mut buf, w, h, &[(20.0, 16.0), (44.0, 16.0)], 20.0, Tool::Smudge.spacing());
         // just right of the boundary: red dragged in, soft alpha
         let o = (16 * w + 33) * 4;
         assert!(buf[o] > 200, "red must be dragged across, got {}", buf[o]);
@@ -689,7 +737,7 @@ mod tests {
     #[test]
     fn smudge_transparent_is_noop() {
         let mut buf = vec![0u8; 32 * 32 * 4];
-        smudge_stroke(&mut buf, 32, 32, &[(4.0, 4.0), (28.0, 28.0)], 16.0);
+        smudge_stroke(&mut buf, 32, 32, &[(4.0, 4.0), (28.0, 28.0)], 16.0, Tool::Smudge.spacing());
         assert!(buf.iter().all(|&b| b == 0), "smudging bare canvas moves nothing");
     }
     #[test]
@@ -700,7 +748,7 @@ mod tests {
         for i in 0..buf.len() {
             buf[i] = 200;
         }
-        smudge_stroke(&mut buf, 32, 32, &[(-60.0, -60.0), (500.0, 500.0)], 24.0);
+        smudge_stroke(&mut buf, 32, 32, &[(-60.0, -60.0), (500.0, 500.0)], 24.0, Tool::Smudge.spacing());
         smudge_dab(&mut buf, 32, 32, -10.0, 16.0, 12.0, 0.35);
         smudge_dab(&mut buf, 32, 32, 30.5, 16.0, 12.0, 0.35); // straddles edge
         assert_eq!(buf.len(), 32 * 32 * 4);
@@ -720,7 +768,7 @@ mod tests {
             buf[o + 3] = 255;
         }
         let before = buf.clone();
-        smudge_stroke(&mut buf, 16, 16, &[(8.0, 8.0)], 10.0);
+        smudge_stroke(&mut buf, 16, 16, &[(8.0, 8.0)], 10.0, Tool::Smudge.spacing());
         assert_eq!(buf, before, "smudging a uniform field changes nothing visible");
     }
     #[test]
