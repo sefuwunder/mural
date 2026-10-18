@@ -65,7 +65,8 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 | key | action |
 |---|---|
 | V / H | move · pan |
-| P | play selected vector/clip (pencil when nothing playable is selected) |
+| P | pencil |
+| space | play selected vector/clip (pause/resume in perform mode) |
 | N M O K S | pen · marker · oil stick · charcoal · smudge |
 | T | text |
 | `[` `]` | brush size |
@@ -81,9 +82,9 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 
 ## Playback
 
-- **P** — toggle playback of the selected object: a vector's animation
-  (same as the panel play/pause button) or a voice clip's audio
-  (same as double-click); with nothing playable selected, P is the pencil
+- **Space** — play the selected object: toggles a vector's animation
+  (same as the panel play/pause button) or plays a voice clip's audio
+  (same as double-click)
 - **Shift+P** (or the ▶ button in the top bar) — **perform mode**: every
   animated vector starts playing and every voice clip starts sounding,
   all at once. A slim transport overlay appears with pause/resume and exit.

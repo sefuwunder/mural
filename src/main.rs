@@ -1352,7 +1352,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             Some(Keycode::F1) => self.show_help = !self.show_help,
             Some(Keycode::V) if !ctrl => self.set_tool(UiTool::Select),
             Some(Keycode::H) if !ctrl => self.set_tool(UiTool::Pan),
-            Some(Keycode::P) if !ctrl && !shift => self.toggle_selection_playback(),
+            Some(Keycode::P) if !ctrl && !shift => self.set_tool(UiTool::Pencil),
             Some(Keycode::P) if !ctrl && shift => self.toggle_perform(),
             Some(Keycode::N) if !ctrl => self.set_tool(UiTool::Pen),
             Some(Keycode::M) if !ctrl => self.set_tool(UiTool::Marker),
@@ -2235,17 +2235,6 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
 
     /// `P`: toggle playback of the selected vector/clip. Falls back to the
     /// legacy pencil-tool shortcut when nothing playable is selected.
-    fn toggle_selection_playback(&mut self) {
-        match playback_target(self.selection) {
-            PlayTarget::Vector(id) => {
-                toggle_vector(&mut self.doc.data.vectors, id);
-                self.vec_tex.remove(&id);
-            }
-            PlayTarget::Clip(id) => self.toggle_play(id),
-            PlayTarget::None => self.set_tool(UiTool::Pencil),
-        }
-    }
-
     fn toggle_perform(&mut self) {
         if self.perform.is_active() {
             self.exit_perform();
@@ -3138,14 +3127,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "MURAL — shortcuts",
             "",
             "V move/select   H pan (or space / mid-drag)",
-            "P play selected vector/clip (else pencil)  N pen  M marker  O oil  K charcoal  S smudge",
+            "P pencil  N pen  M marker  O oil  K charcoal  S smudge",
             "T text: click = point text, drag = text box",
             "text box panel: shape (no/rect/oval), align, size",
             "drag box corners to resize; double-click to re-edit",
             "[ ] brush size   wheel zoom",
             "I import folder   drag & drop works too",
             "A record voice clip (12kHz μ-law 96kbps); A again = stop, esc = cancel",
-            "V + click a clip to select; double-click or space = play; del removes",
+            "V + click to select; space = play selected vector/clip; del removes",
             "shift+P perform: all vectors + clips play; space pause; esc exits",
             "right-click a color swatch to edit it; BG edits canvas",
             "C cycles color set (Studio/Dutch/Pop/Picasso/Basquiat); shift+C = back",
@@ -3668,9 +3657,17 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                                 if self.perform.is_active() {
                                     // Space = pause/resume inside perform mode
                                     self.toggle_perform_pause();
-                                } else if let Some((SelKind::Clip, id)) = self.selection {
-                                    // Space plays the selected clip (repeat-safe: never stops)
-                                    self.play_clip_if_idle(id);
+                                } else {
+                                    // Space = play the selection: vector anim toggles,
+                                    // voice clip plays (repeat-safe: never stops)
+                                    match playback_target(self.selection) {
+                                        PlayTarget::Vector(id) => {
+                                            toggle_vector(&mut self.doc.data.vectors, id);
+                                            self.vec_tex.remove(&id);
+                                        }
+                                        PlayTarget::Clip(id) => self.play_clip_if_idle(id),
+                                        PlayTarget::None => {}
+                                    }
                                 }
                             }
                         } else if !self.on_key(keycode, keymod, video) {
