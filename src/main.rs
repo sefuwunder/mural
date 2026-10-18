@@ -1593,6 +1593,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     _ => return ("E: missing value".to_string(), true, false),
                 };
                 self.sizes[i] = clamp_brush_size(new);
+                if !matches!(op, SetOp::Get) {
+                    self.doc.touch();
+                }
                 (format!("size={}", fmt_num(self.sizes[i])), false, false)
             }
             Prop::Spacing => {
@@ -1609,6 +1612,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     _ => return ("E: missing value".to_string(), true, false),
                 };
                 self.spacings[i] = clamp_spacing(new);
+                if !matches!(op, SetOp::Get) {
+                    self.doc.touch();
+                }
                 (format!("spacing={}", fmt_num(self.spacings[i])), false, false)
             }
             Prop::Color => {
@@ -1624,6 +1630,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     }
                     (SetOp::Sub, Some(x)) => self.color_idx = self.color_idx.saturating_sub(x),
                     _ => return ("E: missing value".to_string(), true, false),
+                }
+                if !matches!(op, SetOp::Get) {
+                    self.doc.touch();
                 }
                 (format!("color={}", self.color_idx), false, false)
             }
@@ -3294,6 +3303,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
 
     /// Save to `path`, returning the status message (shared by Ctrl+S and `:w`).
     fn save_to(&mut self, path: &Path) -> Result<String, String> {
+        // persist the live tool-property overrides into the file
+        self.doc.data.tool_sizes = self.sizes;
+        self.doc.data.tool_spacings = self.spacings;
+        self.doc.data.tool_color = self.color_idx;
         let j = self
             .doc
             .to_json()
@@ -3339,6 +3352,13 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let data = Doc::from_json(&s).map_err(|e| format!("open failed: {e}"))?;
         let n_img = data.images.len();
         self.doc.load_data(data);
+        // restore the saved tool-property overrides (clamped, like :set)
+        {
+            let d = &self.doc.data;
+            self.sizes = d.tool_sizes.map(clamp_brush_size);
+            self.spacings = d.tool_spacings.map(clamp_spacing);
+            self.color_idx = d.tool_color.min(PALETTE_COUNT - 1);
+        }
         self.tiles.clear();
         self.img_tex.clear();
         self.text_tex.clear();

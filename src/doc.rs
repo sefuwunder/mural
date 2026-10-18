@@ -2,6 +2,7 @@
 //! Pure data (no SDL) except via canvas types.
 
 use crate::audio::AudioClip;
+use crate::brush::Tool;
 use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta, VectorMeta};
 use crate::palette::COLOR_SETS;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,16 @@ pub struct DocData {
     /// Legacy files without this field load as 0 ("Studio").
     #[serde(default)]
     pub color_set: usize,
+    /// Per-tool brush size overrides, indexed by brush::Tool::index().
+    /// Legacy files without these fields load factory defaults.
+    #[serde(default = "default_tool_sizes")]
+    pub tool_sizes: [f32; 6],
+    /// Per-tool stamp spacing overrides (fraction of tip diameter).
+    #[serde(default = "default_tool_spacings")]
+    pub tool_spacings: [f32; 6],
+    /// Active palette color index.
+    #[serde(default)]
+    pub tool_color: usize,
 }
 
 pub fn default_bg() -> [u8; 3] {
@@ -50,6 +61,33 @@ pub fn default_bg() -> [u8; 3] {
 
 pub fn default_palette() -> [[u8; 3]; 16] {
     crate::palette::default_rgb()
+}
+
+fn tool_list() -> [Tool; 6] {
+    [
+        Tool::Pencil,
+        Tool::Pen,
+        Tool::Marker,
+        Tool::OilStick,
+        Tool::Charcoal,
+        Tool::Smudge,
+    ]
+}
+
+pub fn default_tool_sizes() -> [f32; 6] {
+    let mut a = [0.0f32; 6];
+    for t in tool_list() {
+        a[t.index()] = t.default_size();
+    }
+    a
+}
+
+pub fn default_tool_spacings() -> [f32; 6] {
+    let mut a = [0.0f32; 6];
+    for t in tool_list() {
+        a[t.index()] = t.spacing();
+    }
+    a
 }
 
 pub struct Doc {
@@ -68,6 +106,9 @@ impl Doc {
         // defaults only apply when loading JSON, not for fresh documents.
         data.bg = default_bg();
         data.palette = default_palette();
+        // Same for the tool-property overrides: factory defaults, not zeros.
+        data.tool_sizes = default_tool_sizes();
+        data.tool_spacings = default_tool_spacings();
         Self {
             data,
             next_id: 1,
@@ -111,6 +152,13 @@ impl Doc {
     /// Mutation counter for the `:q` unsaved-changes check.
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Bump the mutation counter without pushing an undo action.
+    /// Tool-property overrides persist in the file but aren't strokes,
+    /// so they mark the doc dirty this way.
+    pub fn touch(&mut self) {
+        self.seq += 1;
     }
 
     // ---- strokes ----
@@ -632,6 +680,52 @@ mod tests {
         let legacy = Doc::from_json(r#"{"strokes":[],"images":[],"texts":[]}"#).unwrap();
         assert_eq!(legacy.color_set, 0);
         assert_eq!(legacy.palette, COLOR_SETS[0].colors);
+    }
+    #[test]
+    fn tool_overrides_round_trip() {
+        let mut d = Doc::new();
+        d.data.tool_sizes = [3.0, 5.0, 22.0, 30.0, 42.0, 24.0];
+        d.data.tool_spacings = [0.35, 0.35, 0.45, 0.55, 0.9, 0.35];
+        d.data.tool_color = 7;
+        let j = d.to_json().unwrap();
+        for key in ["tool_sizes", "tool_spacings", "tool_color"] {
+            assert!(j.contains(&format!("\"{key}\"")), "{key} must persist in JSON");
+        }
+        let data = Doc::from_json(&j).unwrap();
+        assert_eq!(data.tool_sizes[4], 42.0);
+        assert_eq!(data.tool_spacings[4], 0.9);
+        assert_eq!(data.tool_color, 7);
+    }
+    #[test]
+    fn tool_overrides_legacy_defaults() {
+        // files saved before overrides existed load factory defaults
+        let legacy = Doc::from_json(r#"{"strokes":[],"images":[],"texts":[]}"#).unwrap();
+        assert_eq!(legacy.tool_sizes, default_tool_sizes());
+        assert_eq!(legacy.tool_spacings, default_tool_spacings());
+        assert_eq!(legacy.tool_color, 0);
+        // factory defaults match each tool's own defaults, in index order
+        for t in [
+            Tool::Pencil,
+            Tool::Pen,
+            Tool::Marker,
+            Tool::OilStick,
+            Tool::Charcoal,
+            Tool::Smudge,
+        ] {
+            assert_eq!(legacy.tool_sizes[t.index()], t.default_size());
+            assert_eq!(legacy.tool_spacings[t.index()], t.spacing());
+        }
+        // fresh documents start from factory defaults, not zeros
+        let fresh = Doc::new();
+        assert_eq!(fresh.data.tool_sizes, default_tool_sizes());
+        assert_eq!(fresh.data.tool_spacings, default_tool_spacings());
+    }
+    #[test]
+    fn touch_bumps_seq_without_undo() {
+        let mut d = Doc::new();
+        let s0 = d.seq();
+        d.touch();
+        assert_eq!(d.seq(), s0 + 1);
     }
     #[test]
     fn oil_blur_needs_no_tracking_state() {
