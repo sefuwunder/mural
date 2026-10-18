@@ -85,6 +85,10 @@ pub struct Stroke {
     pub color: usize, // palette index
     pub size: f32,    // world px diameter
     pub points: Vec<(f32, f32)>, // world coords
+    /// Seconds since stroke start, parallel to `points`. Recorded for new
+    /// strokes; empty for legacy files (replay falls back to steady pace).
+    #[serde(default)]
+    pub times: Vec<f32>,
 }
 
 // serde-friendly mirror of brush::Tool (keeps brush SDL-free-ish)
@@ -347,6 +351,7 @@ mod tests {
             color: 0,
             size: 4.0,
             points: vec![(0.0, 0.0), (10.0, 0.0)],
+            times: vec![],
         };
         let b = s.bbox();
         assert!(b.x0 <= -4.0 && b.x1 >= 14.0);

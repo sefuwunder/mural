@@ -177,6 +177,14 @@ impl Doc {
         false
     }
 
+    /// Mark one stroke's tiles dirty without mutating it (used to hide/show
+    /// a stroke during drawing-history replay).
+    pub fn redraw_stroke(&mut self, id: u64) {
+        if let Some(s) = self.data.strokes.iter().find(|s| s.id == id) {
+            self.dirty.push(s.bbox());
+        }
+    }
+
     // ---- images ----
     pub fn add_image(&mut self, m: ImageMeta) {
         self.data.images.push(m.clone());
@@ -622,17 +630,17 @@ mod tests {
     }
 
     fn stroke(id: u64) -> Stroke {
-        Stroke { id, tool: ToolSer::Pen, color: 0, size: 4.0, points: vec![(0.0, 0.0), (5.0, 5.0)] }
+        Stroke { id, tool: ToolSer::Pen, color: 0, size: 4.0, points: vec![(0.0, 0.0), (5.0, 5.0)], times: vec![] }
     }
     fn oil_stroke(id: u64) -> Stroke {
-        Stroke { id, tool: ToolSer::OilStick, color: 3, size: 30.0, points: vec![(0.0, 0.0), (40.0, 10.0)] }
+        Stroke { id, tool: ToolSer::OilStick, color: 3, size: 30.0, points: vec![(0.0, 0.0), (40.0, 10.0)], times: vec![] }
     }
     #[test]
     fn charcoal_stroke_roundtrip() {
         // new ToolSer variant must survive save/load (and old files without
         // it must still load — covered by the legacy color_set test above)
         let mut d = Doc::new();
-        d.add_stroke(Stroke { id: 9, tool: ToolSer::Charcoal, color: 5, size: 18.0, points: vec![(0.0, 0.0), (20.0, 20.0)] });
+        d.add_stroke(Stroke { id: 9, tool: ToolSer::Charcoal, color: 5, size: 18.0, points: vec![(0.0, 0.0), (20.0, 20.0)], times: vec![] });
         let j = d.to_json().unwrap();
         assert!(j.contains("\"Charcoal\""), "charcoal tool must serialize by name");
         let data = Doc::from_json(&j).unwrap();
@@ -641,10 +649,36 @@ mod tests {
         assert_eq!(Tool::from(data.strokes[0].tool), Tool::Charcoal);
     }
     #[test]
+    fn stroke_times_round_trip() {
+        let mut d = Doc::new();
+        let mut s = stroke(1);
+        s.times = vec![0.0, 0.25, 1.5];
+        d.add_stroke(s);
+        let j = d.to_json().unwrap();
+        assert!(j.contains("\"times\""), "times must persist in JSON");
+        let data = Doc::from_json(&j).unwrap();
+        assert_eq!(data.strokes[0].times, vec![0.0, 0.25, 1.5]);
+    }
+    #[test]
+    fn stroke_times_legacy_default() {
+        // files saved before timing existed have no "times" key -> empty
+        let mut d = Doc::new();
+        d.add_stroke(stroke(1));
+        let v: serde_json::Value = serde_json::from_str(&d.to_json().unwrap()).unwrap();
+        let mut stripped = v.clone();
+        stripped["strokes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("times");
+        let data =
+            Doc::from_json(&serde_json::to_string(&stripped).unwrap()).unwrap();
+        assert!(data.strokes[0].times.is_empty());
+    }
+    #[test]
     fn smudge_stroke_roundtrip() {
         // same as charcoal: the new ToolSer variant must survive save/load
         let mut d = Doc::new();
-        d.add_stroke(Stroke { id: 10, tool: ToolSer::Smudge, color: 2, size: 24.0, points: vec![(0.0, 0.0), (30.0, 10.0)] });
+        d.add_stroke(Stroke { id: 10, tool: ToolSer::Smudge, color: 2, size: 24.0, points: vec![(0.0, 0.0), (30.0, 10.0)], times: vec![] });
         let j = d.to_json().unwrap();
         assert!(j.contains("\"Smudge\""), "smudge tool must serialize by name");
         let data = Doc::from_json(&j).unwrap();

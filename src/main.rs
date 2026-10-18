@@ -8,6 +8,7 @@ mod cmd;
 mod doc;
 mod palette;
 mod perform;
+mod replay;
 mod vector;
 
 use audio::{AudioClip, CLIP_RADIUS};
@@ -16,6 +17,7 @@ use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, Te
 use cmd::{Command, ParseError, Prop, SetOp, SetVal, ToolName};
 use doc::Doc;
 use perform::{playback_target, toggle_vector, PerformState, PlayTarget};
+use replay::{replay_command, replay_visible_count, ReplayCmd, ReplayInput};
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
 use palette::{COUNT as PALETTE_COUNT, COLOR_SETS, PAPER_DOT};
 use sdl2::audio::{AudioCallback, AudioDevice, AudioQueue, AudioSpecDesired};
@@ -141,8 +143,31 @@ struct ActiveStroke {
     color: usize,
     size: f32,
     points: Vec<(f32, f32)>, // world
+    times: Vec<f32>,         // seconds since stroke start, parallel to points
+    start: Instant,           // stroke begin (for timing recording)
     last_sx: f32,
     last_sy: f32,
+}
+
+/// View-only replay of a stroke's drawing history. Never mutates the doc:
+/// the full stroke is hidden from tile rasterization while the replay runs.
+struct StrokeReplay {
+    stroke_id: u64,
+    tool: Tool,
+    color: usize,
+    size: f32,
+    points: Vec<(f32, f32)>,
+    times: Vec<f32>, // empty => steady fallback pacing
+    start: Instant,
+}
+
+impl StrokeReplay {
+    fn visible(&self) -> usize {
+        replay_visible_count(&self.times, self.points.len(), self.start.elapsed().as_secs_f32())
+    }
+    fn done(&self) -> bool {
+        self.visible() >= self.points.len()
+    }
 }
 
 struct TextEdit {
@@ -325,6 +350,9 @@ struct App<'tc, 'ttf> {
     move_dx: f32,
     move_dy: f32,
     active_stroke: Option<ActiveStroke>,
+    replay: Option<StrokeReplay>, // drawing-history replay (view-only)
+    replay_done: Option<u64>,     // stroke id whose replay completed
+    last_sel: Option<(SelKind, u64)>, // selection as of last frame (replay arming)
     space_down: bool,
     text_edit: Option<TextEdit>,
     import_buf: Option<String>,
@@ -440,6 +468,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             move_dx: 0.0,
             move_dy: 0.0,
             active_stroke: None,
+            replay: None,
+            replay_done: None,
+            last_sel: None,
             space_down: false,
             text_edit: None,
             import_buf: None,
@@ -501,6 +532,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             }
         }
         let tc = self.tc;
+        let replay_id = self.replay.as_ref().map(|r| r.stroke_id);
         let doc = &self.doc;
         let tips = &mut self.tips;
         let tiles = &mut self.tiles;
@@ -524,7 +556,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 .data
                 .strokes
                 .iter()
-                .any(|s| s.tool == ToolSer::OilStick && s.bbox().intersects(&trect));
+                .any(|s| s.tool == ToolSer::OilStick && Some(s.id) != replay_id && s.bbox().intersects(&trect));
             let mut height: Option<Vec<u8>> = if has_oil {
                 Some(vec![0u8; TILE_PX as usize * TILE_PX as usize])
             } else {
@@ -548,6 +580,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             // paint over it. Same stroke list -> same pixels, always.
             let mut run: Vec<&Stroke> = Vec::new();
             for s in &doc.data.strokes {
+                if Some(s.id) == replay_id {
+                    continue; // hidden while its drawing history replays
+                }
                 let b = s.bbox();
                 if !b.intersects(&trect) {
                     continue;
@@ -1102,6 +1137,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     color: self.color_idx,
                     size: self.brush_size(),
                     points: vec![(wx, wy)],
+                    times: vec![0.0],
+                    start: Instant::now(),
                     last_sx: sx as f32,
                     last_sy: sy as f32,
                 });
@@ -1150,7 +1187,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     let dy = sy as f32 - st.last_sy;
                     if dx * dx + dy * dy > 9.0 {
                         let (wx, wy) = self.cam.screen_to_world(sx as f32, sy as f32, self.win_w as f32, self.win_h as f32);
+                        let t = st.start.elapsed().as_secs_f32();
                         st.points.push((wx, wy));
+                        st.times.push(t);
                         st.last_sx = sx as f32;
                         st.last_sy = sy as f32;
                     }
@@ -1252,6 +1291,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                             color: st.color,
                             size: st.size,
                             points: st.points,
+                            times: st.times,
                         });
                     }
                 }
@@ -1796,6 +1836,7 @@ fn is_image_path(p: &Path) -> bool {
 // ================= rendering =================
 impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn frame(&mut self) -> Result<(), String> {
+        self.poll_replay();
         self.rerasterize();
         // advance vector animations
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
@@ -2260,9 +2301,83 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn exit_perform(&mut self) {
+        self.cancel_replay();
         self.perform.exit(&mut self.doc.data.vectors);
         self.playing.clear(); // Esc stops all audio
         self.perform_paused = false;
+    }
+
+    // ---- stroke drawing-history replay (view-only) ----
+
+    /// Start replaying stroke `id`'s drawing history. The full stroke is
+    /// hidden from the tiles while the replay runs; the visible prefix
+    /// renders through the live-stroke preview path.
+    fn start_replay(&mut self, id: u64) {
+        let s = match self.doc.data.strokes.iter().find(|s| s.id == id) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        if s.points.len() < 2 {
+            self.replay_done = Some(id);
+            return;
+        }
+        // length mismatch (corrupt/legacy) -> steady fallback pacing
+        let times = if s.times.len() == s.points.len() {
+            s.times
+        } else {
+            Vec::new()
+        };
+        self.replay = Some(StrokeReplay {
+            stroke_id: id,
+            tool: s.tool.into(),
+            color: s.color,
+            size: s.size,
+            points: s.points,
+            times,
+            start: Instant::now(),
+        });
+        self.replay_done = None;
+        self.doc.redraw_stroke(id);
+    }
+
+    /// Cancel the running replay and restore the full stroke.
+    fn cancel_replay(&mut self) {
+        if let Some(r) = self.replay.take() {
+            self.doc.redraw_stroke(r.stroke_id);
+        }
+    }
+
+    /// Thin adapter over the pure replay state machine; called each frame.
+    fn poll_replay(&mut self) {
+        // a changed selection clears the completed marker, so re-selecting
+        // a stroke replays it again
+        if self.selection != self.last_sel {
+            self.last_sel = self.selection;
+            self.replay_done = None;
+        }
+        let inp = ReplayInput {
+            replay_id: self.replay.as_ref().map(|r| r.stroke_id),
+            selection: self.selection,
+            replay_done: self.replay_done,
+            target_gone: self
+                .replay
+                .as_ref()
+                .map(|r| !self.doc.data.strokes.iter().any(|s| s.id == r.stroke_id))
+                .unwrap_or(false),
+            busy: self.active_stroke.is_some()
+                || self.perform.is_active()
+                || self.drag != DragKind::None,
+            replay_finished: self.replay.as_ref().map(|r| r.done()).unwrap_or(false),
+        };
+        match replay_command(&inp) {
+            ReplayCmd::None => {}
+            ReplayCmd::Start(id) => self.start_replay(id),
+            ReplayCmd::Cancel => self.cancel_replay(),
+            ReplayCmd::Finish(id) => {
+                self.cancel_replay();
+                self.replay_done = Some(id);
+            }
+        }
     }
 
     /// Space inside perform mode: pause (freeze) or resume.
@@ -2481,35 +2596,54 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn draw_active_stroke(&mut self) -> Result<(), String> {
-        let st = match &self.active_stroke {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        if st.points.len() < 2 {
-            return Ok(());
+        // Gather owned params first: the preview itself needs &mut self.
+        // A running drawing-history replay renders its visible prefix through
+        // the same path as a live stroke.
+        let preview: Option<(Tool, usize, f32, Vec<(f32, f32)>)> =
+            if let Some(st) = &self.active_stroke {
+                (st.points.len() >= 2).then(|| (st.tool, st.color, st.size, st.points.clone()))
+            } else if let Some(r) = &self.replay {
+                let n = r.visible().min(r.points.len());
+                (n >= 2).then(|| (r.tool, r.color, r.size, r.points[..n].to_vec()))
+            } else {
+                None
+            };
+        if let Some((tool, color, size, points)) = preview {
+            return self.draw_stroke_preview(tool, color, size, &points);
         }
+        Ok(())
+    }
+
+    /// Stamp a polyline preview (live stroke or replay prefix) on the canvas.
+    fn draw_stroke_preview(
+        &mut self,
+        tool: Tool,
+        color: usize,
+        size: f32,
+        points: &[(f32, f32)],
+    ) -> Result<(), String> {
         let cam = self.cam;
         let (w, h) = (self.win_w as f32, self.win_h as f32);
-        let dpx = (st.size * cam.zoom).max(2.0) as u32;
+        let dpx = (size * cam.zoom).max(2.0) as u32;
         // borrow juggling: get tip, then stamp
         // smudge ignores the paint color (a finger, not a brush): preview it
         // as a neutral gray ghost so the stroke doesn't promise paint
-        let col = if st.tool == Tool::Smudge {
+        let col = if tool == Tool::Smudge {
             Color::RGB(200, 200, 200)
         } else {
-            self.pal(st.color)
+            self.pal(color)
         };
         let tc = self.tc;
-        let spacing = Self::brush_spacing(&self.spacings, st.tool);
+        let spacing = Self::brush_spacing(&self.spacings, tool);
         let tips = &mut self.tips;
         let canvas = &mut self.canvas;
-        let tip = tips.get(tc, st.tool, dpx).map_err(|e| e)?;
+        let tip = tips.get(tc, tool, dpx).map_err(|e| e)?;
         tip.set_color_mod(col.r, col.g, col.b);
-        let scr: Vec<(f32, f32)> = st.points.iter().map(|&(x, y)| cam.world_to_screen(x, y, w, h)).collect();
+        let scr: Vec<(f32, f32)> = points.iter().map(|&(x, y)| cam.world_to_screen(x, y, w, h)).collect();
         for pair in scr.windows(2) {
             let (x0, y0) = pair[0];
             let (x1, y1) = pair[1];
-            walk_segment(x0, y0, x1, y1, st.size * cam.zoom, spacing, |x, y, dd| {
+            walk_segment(x0, y0, x1, y1, size * cam.zoom, spacing, |x, y, dd| {
                 let _ = blit_stamp(canvas, tip, x, y, dd);
             });
         }
@@ -3134,7 +3268,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "[ ] brush size   wheel zoom",
             "I import folder   drag & drop works too",
             "A record voice clip (12kHz μ-law 96kbps); A again = stop, esc = cancel",
-            "V + click to select; space = play selected vector/clip; del removes",
+            "V + click to select; space = replay stroke / play vector+clip; del removes",
             "shift+P perform: all vectors + clips play; space pause; esc exits",
             "right-click a color swatch to edit it; BG edits canvas",
             "C cycles color set (Studio/Dutch/Pop/Picasso/Basquiat); shift+C = back",
@@ -3657,6 +3791,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                                 if self.perform.is_active() {
                                     // Space = pause/resume inside perform mode
                                     self.toggle_perform_pause();
+                                } else if let Some((SelKind::Stroke, id)) = self.selection {
+                                    // Space = restart the stroke's drawing-history replay
+                                    self.cancel_replay();
+                                    self.replay_done = None;
+                                    self.start_replay(id);
                                 } else {
                                     // Space = play the selection: vector anim toggles,
                                     // voice clip plays (repeat-safe: never stops)
@@ -3710,6 +3849,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 color: (i * 3 + 1) % PALETTE_COUNT,
                 size: tool.default_size() * 1.6,
                 points: pts,
+                times: vec![],
             });
         }
         // undo/redo round-trip on strokes (before image/text are added)

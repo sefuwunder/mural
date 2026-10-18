@@ -82,6 +82,11 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 
 ## Playback
 
+- **Selecting a paint stroke** replays its drawing history with true timing
+  — your real rhythm, pauses included. Strokes drawn before timing was
+  recorded (older files) replay at a steady pace instead. **Space** on a
+  selected stroke restarts the replay. The replay is view-only: Esc,
+  deselect, starting a new stroke, or perform mode cancels it.
 - **Space** — play the selected object: toggles a vector's animation
   (same as the panel play/pause button) or plays a voice clip's audio
   (same as double-click)
