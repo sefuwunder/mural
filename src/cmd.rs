@@ -51,6 +51,7 @@ pub enum Command {
     Undo,
     Redo,
     Help,
+    Mixer,
 }
 
 #[derive(Debug, PartialEq)]
@@ -112,7 +113,7 @@ pub fn resolve_tool(s: &str) -> Result<ToolName, ParseError> {
 
 /// (command name, shortest accepted abbreviation length).
 /// `:e` is edit even though it also prefixes `export` (vim convention).
-const COMMANDS: [(&str, usize); 10] = [
+const COMMANDS: [(&str, usize); 11] = [
     ("write", 1),
     ("quit", 1),
     ("edit", 1),
@@ -123,6 +124,7 @@ const COMMANDS: [(&str, usize); 10] = [
     ("undo", 1),
     ("redo", 1),
     ("help", 1),
+    ("mixer", 1),
 ];
 
 fn resolve_command(word: &str) -> Result<&'static str, ParseError> {
@@ -250,6 +252,7 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
         "help" => Ok(Command::Help),
+        "mixer" => Ok(Command::Mixer),
         _ => Err(ParseError::UnknownCommand(word.to_string())),
     }
 }

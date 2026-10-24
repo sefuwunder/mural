@@ -125,9 +125,20 @@ pub struct AudioClip {
     pub y: f64,
     pub seconds: f32, // decoded length; data.len() should equal seconds * 12000
     pub data: String,  // base64 μ-law bytes
+    /// Mixer track, 1-based (1..=4). Legacy files without it load as 1.
+    #[serde(default = "default_track")]
+    pub track: u8,
+}
+
+fn default_track() -> u8 {
+    1
 }
 
 impl AudioClip {
+    /// 0-based track index, clamped so a hand-edited file can't panic the mixer.
+    pub fn track_idx(&self) -> usize {
+        (self.track.clamp(1, MIX_TRACKS as u8) - 1) as usize
+    }
     /// Marker bounds in world coords (for hit-testing, dirty rects, export).
     pub fn rect(&self) -> Rect {
         let (x, y, r) = (self.x as f32, self.y as f32, CLIP_RADIUS as f32);
@@ -141,6 +152,87 @@ impl AudioClip {
     pub fn pcm(&self) -> Result<Vec<i16>, String> {
         Ok(b64decode(&self.data)?.iter().map(|&u| mulaw_decode(u)).collect())
     }
+}
+
+/// Four-track mixer: every voice clip is routed to one of four tracks.
+/// Pure state + mix math, no SDL: the App owns one SDL playback device
+/// whose callback runs `mix_voices` over the shared voices, so fader moves
+/// take effect live with no clip restart.
+pub const MIX_TRACKS: usize = 4;
+
+/// Muted-but-readable track colors: Braun orange, sage, dusty blue, plum.
+pub const TRACK_COLORS: [[u8; 3]; MIX_TRACKS] =
+    [[0xD9, 0x6C, 0x33], [0x6F, 0x9E, 0x6E], [0x5B, 0x84, 0xAE], [0x8E, 0x7A, 0xA8]];
+
+/// Fader/meter state for the four tracks + master. Persisted in mural.json.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MixerState {
+    pub vol: [f32; MIX_TRACKS],
+    pub mute: [bool; MIX_TRACKS],
+    pub solo: [bool; MIX_TRACKS],
+    pub master: f32,
+}
+
+impl Default for MixerState {
+    fn default() -> Self {
+        Self {
+            vol: [0.8; MIX_TRACKS],
+            mute: [false; MIX_TRACKS],
+            solo: [false; MIX_TRACKS],
+            master: 1.0,
+        }
+    }
+}
+
+impl MixerState {
+    /// Effective linear gain for a track: 0 when muted, or when any other
+    /// track is soloed; otherwise track fader x master. Out-of-range
+    /// tracks are silent, never a panic.
+    pub fn track_gain(&self, track: usize) -> f32 {
+        if track >= MIX_TRACKS || self.mute[track] {
+            return 0.0;
+        }
+        if self.solo.iter().any(|s| *s) && !self.solo[track] {
+            return 0.0;
+        }
+        self.vol[track].clamp(0.0, 1.0) * self.master.clamp(0.0, 1.0)
+    }
+}
+
+/// One playing voice in the mixer.
+pub struct Voice {
+    pub clip_id: u64,
+    pub pcm: Vec<i16>,
+    pub pos: usize,
+    pub track: usize, // 0-based; clamped at voice creation
+}
+
+/// Mix all voices into `out`, advancing every voice's position whether or
+/// not it is audible (a muted track stays in sync, so unmuting resumes
+/// mid-clip rather than restarting it). Returns per-track peak levels
+/// (0.0-1.0, post-gain) for the meters. Samples are summed in f32 and
+/// hard-clamped: four full-scale voices can never wrap around.
+pub fn mix_voices(voices: &mut [Voice], state: &MixerState, out: &mut [i16]) -> [f32; MIX_TRACKS] {
+    let mut acc = vec![0f32; out.len()];
+    let mut peaks = [0f32; MIX_TRACKS];
+    for v in voices.iter_mut() {
+        let gain = state.track_gain(v.track);
+        let remaining = v.pcm.len().saturating_sub(v.pos);
+        let n = remaining.min(out.len());
+        for i in 0..n {
+            let s = v.pcm[v.pos + i] as f32 * gain;
+            acc[i] += s;
+            let p = (s.abs() / 32768.0).min(1.0);
+            if p > peaks[v.track] {
+                peaks[v.track] = p;
+            }
+        }
+        v.pos += n;
+    }
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = acc[i].clamp(-32768.0, 32767.0) as i16;
+    }
+    peaks
 }
 
 #[cfg(test)]
@@ -217,16 +309,93 @@ mod tests {
             y: -3.25,
             seconds: 2.0,
             data: b64encode(&ulaw),
+            track: 2,
         };
         let j = serde_json::to_string(&c).unwrap();
         let back: AudioClip = serde_json::from_str(&j).unwrap();
         assert_eq!(back.id, 42);
         assert_eq!(back.seconds, 2.0);
         assert_eq!(back.data, c.data);
+        assert_eq!(back.track, 2);
+        assert_eq!(back.track_idx(), 1);
         assert_eq!(back.pcm().unwrap().len(), 24000);
         assert_eq!(back.duration_label(), "0:02");
         let r = back.rect();
         assert!((r.x0 - (10.5 - CLIP_RADIUS as f32)).abs() < 1e-6);
         assert!((r.x1 - (10.5 + CLIP_RADIUS as f32)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clip_track_defaults_to_1_and_clamps() {
+        // legacy file without the track field
+        let j = r#"{"id":7,"x":0.0,"y":0.0,"seconds":1.0,"data":""}"#;
+        let back: AudioClip = serde_json::from_str(j).unwrap();
+        assert_eq!(back.track, 1);
+        assert_eq!(back.track_idx(), 0);
+        let mut c = back.clone();
+        c.track = 9; // hand-edited: clamps to track 4, never panics
+        assert_eq!(c.track_idx(), 3);
+        c.track = 0;
+        assert_eq!(c.track_idx(), 0);
+    }
+
+    #[test]
+    fn mixer_gain_mute_solo_master() {
+        let mut st = MixerState::default();
+        assert!((st.track_gain(0) - 0.8).abs() < 1e-6);
+        st.mute[1] = true;
+        assert_eq!(st.track_gain(1), 0.0);
+        assert!(st.track_gain(0) > 0.0);
+        st.solo[2] = true; // any solo silences every non-soloed track
+        assert_eq!(st.track_gain(0), 0.0);
+        assert_eq!(st.track_gain(1), 0.0);
+        assert!(st.track_gain(2) > 0.0);
+        st.solo[2] = false;
+        st.master = 0.5;
+        assert!((st.track_gain(0) - 0.4).abs() < 1e-6);
+        assert_eq!(st.track_gain(99), 0.0); // out of range: silent
+    }
+
+    #[test]
+    fn mix_voices_sums_gains_clamps_and_reports_peaks() {
+        let mut st = MixerState::default();
+        st.vol = [1.0, 1.0, 1.0, 1.0];
+        let mut voices = vec![
+            Voice { clip_id: 1, pcm: vec![20000; 8], pos: 0, track: 0 },
+            Voice { clip_id: 2, pcm: vec![20000; 8], pos: 0, track: 1 },
+        ];
+        let mut out = [0i16; 8];
+        let peaks = mix_voices(&mut voices, &st, &mut out);
+        // 40000 would wrap as i16; the mixer clamps instead
+        assert!(out.iter().all(|&s| s == 32767), "out {:?}", out);
+        assert!((peaks[0] - 20000.0 / 32768.0).abs() < 1e-4);
+        assert!((peaks[1] - 20000.0 / 32768.0).abs() < 1e-4);
+        assert_eq!(peaks[2], 0.0);
+        assert_eq!(voices[0].pos, 8);
+    }
+
+    #[test]
+    fn mix_voices_muted_track_advances_in_sync() {
+        let mut st = MixerState::default();
+        st.mute[0] = true;
+        let mut voices = vec![Voice { clip_id: 1, pcm: vec![10000; 16], pos: 0, track: 0 }];
+        let mut out = [0i16; 8];
+        mix_voices(&mut voices, &st, &mut out);
+        assert!(out.iter().all(|&s| s == 0));
+        assert_eq!(voices[0].pos, 8); // advanced: unmute resumes mid-clip
+        st.mute[0] = false;
+        mix_voices(&mut voices, &st, &mut out);
+        assert!(out.iter().all(|&s| s == 8000)); // 10000 * 0.8 default fader
+        assert_eq!(voices[0].pos, 16);
+    }
+
+    #[test]
+    fn mix_voices_empty_is_silence() {
+        let st = MixerState::default();
+        let mut voices: Vec<Voice> = Vec::new();
+        let mut out = [123i16; 4]; // garbage in: silence out
+        let peaks = mix_voices(&mut voices, &st, &mut out);
+        assert!(out.iter().all(|&s| s == 0));
+        assert_eq!(peaks, [0.0; MIX_TRACKS]);
     }
 }

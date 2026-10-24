@@ -78,6 +78,8 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
 | ctrl+S / ctrl+O | save / open `mural.json` |
 | ctrl+E | export PNG (content bounds) |
 | ctrl+0 | reset view |
+| MIX / `:mixer` | 4-track mixer for voice clips |
+| 1–4 | route selected clip to mixer track 1–4 |
 | F1 | this help |
 
 ## Playback
@@ -98,6 +100,23 @@ deleted, undone/redone, saved in `mural.json`, and exported to PNG.
   pre-perform play/pause state
 - While performing, canvas editing is suspended — only transport keys
   (and the overlay buttons) respond
+
+## Mixer
+
+Four-track mixer for voice clips, in a Teenage Engineering / Braun
+hardware idiom: one warm off-white unit, four color-coded strips plus a
+master, vertical faders, M (mute) and S (solo) buttons, live meters.
+
+- **MIX** button in the top bar (or `:mixer`) — show / hide the mixer.
+  Entering perform mode with clips on the canvas brings it up automatically.
+- Every clip is routed to one of **4 tracks**: `1`–`4` with a clip selected
+  routes it; new recordings land on the emptiest track. The clip marker
+  carries a small badge in its track's color.
+- Faders move live — no clip restart — because playback runs through one
+  mixer device, not one queue per clip. Mute silences a track, solo
+  silences everything else, master scales the whole mix. Muted tracks keep
+  playing in sync, so unmuting resumes mid-clip.
+- Fader, mute, solo, master, and clip routing all persist in `mural.json`.
 
 ## Command line
 

@@ -11,7 +11,7 @@ mod perform;
 mod replay;
 mod vector;
 
-use audio::{AudioClip, CLIP_RADIUS};
+use audio::{mix_voices, AudioClip, MixerState, Voice, CLIP_RADIUS, MIX_TRACKS, TRACK_COLORS};
 use brush::{blit_stamp, box_blur_rgba, clamp_brush_size, clamp_spacing, light_oil_region, smudge_stroke, stamp_height, walk_segment, TipCache, Tool};
 use canvas::{union_rects, AnimKind, Camera, ImageMeta, Rect, SelKind, Stroke, TextMeta, ToolSer, VectorMeta};
 use cmd::{Command, ParseError, Prop, SetOp, SetVal, ToolName};
@@ -20,7 +20,7 @@ use perform::{playback_target, toggle_vector, PerformState, PlayTarget};
 use replay::{replay_command, replay_visible_count, ReplayCmd, ReplayInput};
 use vector::{point_in_poly, rebuild_polys, render_frame, vectorize_rgba, TracedPoly};
 use palette::{COUNT as PALETTE_COUNT, COLOR_SETS, PAPER_DOT};
-use sdl2::audio::{AudioCallback, AudioDevice, AudioQueue, AudioSpecDesired};
+use sdl2::audio::{AudioCallback, AudioDevice, AudioSpecDesired};
 use sdl2::AudioSubsystem;
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, Mod};
@@ -215,12 +215,49 @@ struct RecState {
     freq: i32,
 }
 
-/// An in-progress playback. The queue is held alive for its Drop effect.
+/// An in-progress playback. The audio itself lives in the mixer voices;
+/// this is the UI-side record (progress ring, elapsed label, restart).
 struct PlayState {
-    _q: AudioQueue<i16>,
     clip_id: u64,
     start: Instant,
     seconds: f32,
+}
+
+/// State shared with the single playback device's audio callback.
+/// The callback locks this once per buffer (~85 ms at 12 kHz), mixes
+/// every live voice, and records per-track peaks for the meters.
+pub struct MixerShared {
+    pub state: MixerState,
+    pub voices: Vec<Voice>,
+    pub peaks: [f32; MIX_TRACKS],
+}
+
+impl Default for MixerShared {
+    fn default() -> Self {
+        Self { state: MixerState::default(), voices: Vec::new(), peaks: [0.0; MIX_TRACKS] }
+    }
+}
+
+/// The one playback device: mixes all voices every callback, drops
+/// finished voices, publishes peaks. Silence when empty.
+pub struct MixerCallback {
+    pub shared: Arc<Mutex<MixerShared>>,
+}
+
+impl AudioCallback for MixerCallback {
+    type Channel = i16;
+    fn callback(&mut self, out: &mut [i16]) {
+        let mut sh = match self.shared.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // clone the small gain state so voices and gains don't borrow
+        // the shared struct twice in one call
+        let state = sh.state.clone();
+        let peaks = mix_voices(&mut sh.voices, &state, out);
+        sh.peaks = peaks;
+        sh.voices.retain(|v| v.pos < v.pcm.len());
+    }
 }
 
 /// `m:ss` for a float second count.
@@ -292,6 +329,8 @@ enum DragKind {
     PalSlider(u8),
     TextBox,
     ResizeText(u64, u8),
+    /// Mixer fader drag: 0..3 = track, MIX_TRACKS = master.
+    MixerFader(u8),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -313,6 +352,32 @@ enum PanelAction {
 enum PerformAction {
     TogglePause,
     Exit,
+}
+
+/// Mixer-panel buttons.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MixerAction {
+    Mute(usize),
+    Solo(usize),
+    Close,
+}
+
+/// One strip of the mixer panel: fader track + cap, meter, M/S buttons.
+struct MixerStripGeom {
+    fader: SdlRect,
+    cap: SdlRect,
+    meter: SdlRect,
+    mute: SdlRect,
+    solo: SdlRect,
+    cx: i32, // strip center x (for labels)
+}
+
+/// Whole mixer panel geometry: panel + close button + 5 strips
+/// (tracks 0..3, master at MIX_TRACKS).
+struct MixerGeom {
+    panel: SdlRect,
+    close: SdlRect,
+    strips: [MixerStripGeom; 5],
 }
 
 struct App<'tc, 'ttf> {
@@ -378,6 +443,13 @@ struct App<'tc, 'ttf> {
     audio_ss: Option<AudioSubsystem>,
     rec: Option<RecState>,
     playing: Vec<PlayState>, // every currently-playing clip (perform mode plays all at once)
+    // four-track mixer: one playback device mixes all voices; the panel
+    // edits doc.mixer (persisted) and the shared live state together
+    mixer: Arc<Mutex<MixerShared>>,
+    mixer_dev: Option<AudioDevice<MixerCallback>>,
+    show_mixer: bool,
+    mixer_hits: Vec<(SdlRect, MixerAction)>,
+    mixer_peaks: [f32; MIX_TRACKS], // smoothed display peaks (decay per frame)
     // global perform mode (Shift+P)
     perform: PerformState,
     perform_paused: bool,
@@ -490,6 +562,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             audio_ss: None,
             rec: None,
             playing: Vec::new(),
+            mixer: Arc::new(Mutex::new(MixerShared::default())),
+            mixer_dev: None,
+            show_mixer: false,
+            mixer_hits: Vec::new(),
+            mixer_peaks: [0.0; MIX_TRACKS],
             perform: PerformState::new(),
             perform_paused: false,
             perform_hits: Vec::new(),
@@ -854,6 +931,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn perform_button_rect(&self) -> SdlRect {
         SdlRect::new(110, 8, 64, 28)
     }
+    fn mixer_button_rect(&self) -> SdlRect {
+        SdlRect::new(182, 8, 64, 28)
+    }
     fn color_popup_rect(&self) -> SdlRect {
         let (w, h) = (self.win_w as i32, self.win_h as i32);
         SdlRect::new((w - 320) / 2, (h - 230) / 2, 320, 230)
@@ -876,6 +956,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         if let Some(r) = self.text_panel_rect() {
             if r.contains_point((sx, sy)) {
                 return true;
+            }
+        }
+        // the mixer panel floats above the bottom bar, same as the panels
+        if self.show_mixer {
+            if let Some(g) = self.mixer_geom() {
+                if g.panel.contains_point((sx, sy)) {
+                    return true;
+                }
             }
         }
         if self.color_edit.is_some() && self.color_popup_rect().contains_point((sx, sy)) {
@@ -1013,11 +1101,19 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.toggle_perform();
                 return;
             }
+            if self.mixer_button_rect().contains_point((sx, sy)) {
+                self.show_mixer = !self.show_mixer;
+                return;
+            }
             for (r, act) in self.perform_hits.clone() {
                 if r.contains_point((sx, sy)) {
                     self.perform_action(act);
                     return;
                 }
+            }
+            // the mixer stays live while performing: buttons + faders work
+            if self.mixer_click(sx, sy) {
+                return;
             }
             return;
         }
@@ -1158,6 +1254,16 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn on_motion(&mut self, sx: i32, sy: i32) {
+        // mixer faders stay live even while performing (canvas is suspended)
+        if let DragKind::MixerFader(i) = self.drag {
+            if let Some(g) = self.mixer_geom() {
+                if let Some(s) = g.strips.get(i as usize) {
+                    let v = 1.0 - (sy - s.fader.y()) as f32 / (s.fader.height() as f32 - 12.0);
+                    self.set_mixer_vol(i, v);
+                }
+            }
+            return;
+        }
         if self.perform.is_active() {
             return; // canvas input suspended in perform mode
         }
@@ -1261,10 +1367,16 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 }
             }
             DragKind::None => {}
+            DragKind::MixerFader(_) => {} // handled by the early return above
         }
     }
 
     fn on_up(&mut self, _btn: MouseButton, video: &sdl2::VideoSubsystem) {
+        // a mixer fader drag ends even while performing
+        if let DragKind::MixerFader(_) = self.drag {
+            self.drag = DragKind::None;
+            return;
+        }
         if self.perform.is_active() {
             return; // canvas input suspended in perform mode
         }
@@ -1315,6 +1427,26 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     fn on_wheel(&mut self, y: i32, mx: i32, my: i32) {
+        // wheel over a mixer fader nudges it (works while performing too)
+        if let Some(g) = self.mixer_geom() {
+            for (i, s) in g.strips.iter().enumerate() {
+                let grab = SdlRect::new(
+                    s.fader.x() - 14,
+                    s.fader.y() - 4,
+                    s.fader.width() + 28,
+                    s.fader.height() + 8,
+                );
+                if grab.contains_point((mx, my)) {
+                    let cur = if i >= MIX_TRACKS {
+                        self.doc.data.mixer.master
+                    } else {
+                        self.doc.data.mixer.vol[i]
+                    };
+                    self.set_mixer_vol(i as u8, cur + if y > 0 { 0.05 } else { -0.05 });
+                    return;
+                }
+            }
+        }
         if self.ui_hit(mx, my) {
             return;
         }
@@ -1407,6 +1539,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             Some(Keycode::X) if !ctrl => self.vectorize_selection(),
             Some(Keycode::A) if !ctrl => self.toggle_record(),
             Some(Keycode::C) if !ctrl => self.cycle_color_set(if shift { -1 } else { 1 }),
+            Some(Keycode::Num1) if !ctrl => self.assign_clip_track(1),
+            Some(Keycode::Num2) if !ctrl => self.assign_clip_track(2),
+            Some(Keycode::Num3) if !ctrl => self.assign_clip_track(3),
+            Some(Keycode::Num4) if !ctrl => self.assign_clip_track(4),
             Some(Keycode::LeftBracket) => self.set_brush_size(self.brush_size() / 1.25),
             Some(Keycode::RightBracket) => self.set_brush_size(self.brush_size() * 1.25),
             Some(Keycode::Z) if ctrl && !shift => self.do_undo(),
@@ -1651,6 +1787,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 self.show_help = true;
                 (String::new(), false, false)
             }
+            Command::Mixer => {
+                self.show_mixer = !self.show_mixer;
+                (
+                    if self.show_mixer { "mixer shown".to_string() } else { "mixer hidden".to_string() },
+                    false,
+                    false,
+                )
+            }
         }
     }
 
@@ -1876,6 +2020,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         self.draw_import_bar()?;
         self.draw_cmdline()?;
         self.draw_perform_bar()?;
+        self.draw_mixer()?;
         self.draw_toast()?;
         self.canvas.present();
         Ok(())
@@ -1913,7 +2058,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                 dev.resume();
                 self.rec = Some(RecState { _dev: dev, buf, start: Instant::now(), freq });
                 // stop any playback while recording
-                self.playing.clear();
+                self.stop_all_audio();
             }
             Err(e) => self.toast(&format!("no mic ({})", e)),
         }
@@ -1940,12 +2085,19 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         } else {
             self.cam.screen_to_world(self.mouse_sx as f32, self.mouse_sy as f32, w, h)
         };
+        // new clips land on the emptiest track, so a fresh performance
+        // spreads across the mixer instead of piling onto track 1
+        let track = (0..MIX_TRACKS)
+            .min_by_key(|t| self.doc.data.clips.iter().filter(|c| c.track_idx() == *t).count())
+            .unwrap_or(0) as u8
+            + 1;
         let clip = AudioClip {
             id,
             x: wx as f64,
             y: wy as f64,
             seconds,
             data: audio::b64encode(&ulaw),
+            track,
         };
         self.doc.add_clip(clip);
         self.selection = Some((SelKind::Clip, id));
@@ -1962,7 +2114,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     /// Double-click toggles; Space plays (never stops, so key-repeat is safe).
     fn toggle_play(&mut self, id: u64) {
         if self.playing.iter().any(|p| p.clip_id == id) {
-            self.playing.retain(|p| p.clip_id != id);
+            self.stop_clip(id);
             return;
         }
         self.play_clip(id);
@@ -1978,6 +2130,23 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     fn play_clip(&mut self, id: u64) {
         if let Err(e) = self.start_clip(id) {
             self.toast(&e);
+        }
+    }
+
+    /// Open the single mixer playback device on first use.
+    fn ensure_mixer_device(&mut self) -> Result<(), String> {
+        if self.mixer_dev.is_some() {
+            return Ok(());
+        }
+        let ss = self.audio_ss.clone().ok_or_else(|| "no audio subsystem".to_string())?;
+        let shared = self.mixer.clone();
+        match ss.open_playback(None::<&str>, &Self::clip_spec(), move |_spec| MixerCallback { shared }) {
+            Ok(dev) => {
+                dev.resume();
+                self.mixer_dev = Some(dev);
+                Ok(())
+            }
+            Err(e) => Err(format!("no audio out ({})", e)),
         }
     }
 
@@ -2002,22 +2171,80 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
                     Ok(p)
                 }
             })?;
-        let ss = self.audio_ss.clone().ok_or_else(|| "no audio subsystem".to_string())?;
-        match ss.open_queue::<i16, _>(None::<&str>, &Self::clip_spec()) {
-            Ok(q) => {
-                q.queue_audio(&pcm).map_err(|_| "playback failed".to_string())?;
-                q.resume();
-                // one entry per clip: a restart replaces the old one
-                self.playing.retain(|p| p.clip_id != id);
-                self.playing.push(PlayState {
-                    _q: q,
-                    clip_id: id,
-                    start: Instant::now(),
-                    seconds: clip.seconds.max(0.1),
-                });
-                Ok(())
+        self.ensure_mixer_device()?;
+        // one voice per clip: a restart replaces the old one, from the top
+        if let Ok(mut sh) = self.mixer.lock() {
+            sh.voices.retain(|v| v.clip_id != id);
+            sh.voices.push(Voice { clip_id: id, pcm, pos: 0, track: clip.track_idx() });
+        }
+        self.playing.retain(|p| p.clip_id != id);
+        self.playing.push(PlayState {
+            clip_id: id,
+            start: Instant::now(),
+            seconds: clip.seconds.max(0.1),
+        });
+        Ok(())
+    }
+
+    /// Stop every voice + UI record (pause, exit perform, record start).
+    fn stop_all_audio(&mut self) {
+        if let Ok(mut sh) = self.mixer.lock() {
+            sh.voices.clear();
+        }
+        self.playing.clear();
+    }
+
+    /// Stop one clip's voice + UI record (double-click toggle).
+    fn stop_clip(&mut self, id: u64) {
+        if let Ok(mut sh) = self.mixer.lock() {
+            sh.voices.retain(|v| v.clip_id != id);
+        }
+        self.playing.retain(|p| p.clip_id != id);
+    }
+
+    /// Mixer edits write the persisted snapshot and the live callback
+    /// state together, then mark the doc dirty. Faders are performance
+    /// controls, not canvas edits: no undo entry (same as tool sizes).
+    fn set_mixer_vol(&mut self, strip: u8, v: f32) {
+        let v = v.clamp(0.0, 1.0);
+        if strip as usize >= MIX_TRACKS {
+            self.doc.data.mixer.master = v;
+        } else {
+            self.doc.data.mixer.vol[strip as usize] = v;
+        }
+        if let Ok(mut sh) = self.mixer.lock() {
+            sh.state = self.doc.data.mixer.clone();
+        }
+        self.doc.touch();
+    }
+
+    fn mixer_action(&mut self, act: MixerAction) {
+        match act {
+            MixerAction::Mute(t) => {
+                let m = &mut self.doc.data.mixer.mute[t];
+                *m = !*m;
             }
-            Err(e) => Err(format!("no audio out ({})", e)),
+            MixerAction::Solo(t) => {
+                let s = &mut self.doc.data.mixer.solo[t];
+                *s = !*s;
+            }
+            MixerAction::Close => {
+                self.show_mixer = false;
+                return;
+            }
+        }
+        if let Ok(mut sh) = self.mixer.lock() {
+            sh.state = self.doc.data.mixer.clone();
+        }
+        self.doc.touch();
+    }
+
+    /// Route the selected clip to a mixer track (keys 1-4).
+    fn assign_clip_track(&mut self, track: u8) {
+        if let Some((SelKind::Clip, id)) = self.selection {
+            if self.doc.set_clip_track(id, track) {
+                self.toast(&format!("clip → track {}", track));
+            }
         }
     }
 
@@ -2101,6 +2328,14 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             self.label_fade = 1.0;
             self.draw_label(&label, if selected { ACCENT } else { INK }, cx - sr, cy + sr + 4)?;
             self.label_fade = save;
+            // mixer track badge (bottom-right of the marker; drawn after
+            // the last use of the `playing` borrow so labels can borrow self)
+            let tc = TRACK_COLORS[c.track_idx()];
+            let bx = cx + (sr as f32 * 0.72) as i32;
+            let by = cy + (sr as f32 * 0.72) as i32;
+            self.canvas.set_draw_color(Color::RGB(tc[0], tc[1], tc[2]));
+            self.canvas.fill_rect(SdlRect::new(bx - 8, by - 8, 16, 16))?;
+            self.draw_label(&format!("{}", c.track), Color::RGB(0xFF, 0xFF, 0xFF), bx - 3, by - 7)?;
         }
         Ok(())
     }
@@ -2298,12 +2533,17 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         for id in ids {
             let _ = self.start_clip(id);
         }
+        // performing is when mixing matters: bring the mixer up
+        // automatically when there are clips to mix
+        if any_clip {
+            self.show_mixer = true;
+        }
     }
 
     fn exit_perform(&mut self) {
         self.cancel_replay();
         self.perform.exit(&mut self.doc.data.vectors);
-        self.playing.clear(); // Esc stops all audio
+        self.stop_all_audio(); // Esc stops all audio
         self.perform_paused = false;
     }
 
@@ -2394,7 +2634,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             }
             self.perform_paused = false;
         } else {
-            self.playing.clear();
+            self.stop_all_audio();
             self.perform_paused = true;
         }
     }
@@ -3083,6 +3323,10 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let pr = self.perform_button_rect();
         self.button(pr, "▶", self.perform.is_active())?;
         self.draw_label("perform", DIM, pr.x() + 8, pr.y() + 32)?;
+        // mixer button: 4-track mixer for voice clips
+        let mr = self.mixer_button_rect();
+        self.button(mr, "MIX", self.show_mixer)?;
+        self.draw_label("mixer", DIM, mr.x() + 8, mr.y() + 32)?;
         self.button(SdlRect::new(w - 76, 8, 64, 28), "?", self.show_help)?;
         // left toolbar
         self.cc(CHROME);
@@ -3192,6 +3436,11 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             }
             return;
         }
+        // mixer panel first: it paints over the vector panel when both
+        // are visible, so it must win clicks in the overlap
+        if self.mixer_click(sx, sy) {
+            return;
+        }
         // vector panel hits
         for (r, act) in self.panel_hits.clone() {
             if r.contains_point((sx, sy)) {
@@ -3245,6 +3494,9 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         if self.perform_button_rect().contains_point((sx, sy)) {
             self.toggle_perform();
         }
+        if self.mixer_button_rect().contains_point((sx, sy)) {
+            self.show_mixer = !self.show_mixer;
+        }
     }
 
     fn draw_help(&mut self) -> Result<(), String> {
@@ -3270,6 +3522,8 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "A record voice clip (12kHz μ-law 96kbps); A again = stop, esc = cancel",
             "V + click to select; space = replay stroke / play vector+clip; del removes",
             "shift+P perform: all vectors + clips play; space pause; esc exits",
+            "MIX button / :mixer — 4-track mixer for voice clips (live faders, M mute, S solo)",
+            "1-4 route the selected clip to mixer track 1-4; new clips land on the emptiest track",
             "right-click a color swatch to edit it; BG edits canvas",
             "C cycles color set (Studio/Dutch/Pop/Picasso/Basquiat); shift+C = back",
             "del remove selected   esc deselect",
@@ -3280,7 +3534,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             "",
             "paint sits above images, text above paint",
             "",
-            ": command line — :w :q :e :tool :set :color :export :undo :redo :help",
+            ": command line — :w :q :e :tool :set :color :export :undo :redo :help :mixer",
             ":set size|spacing|color[=v] — per-tool props; += / -= work",
             "",
             "F1 closes this",
@@ -3296,6 +3550,166 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
     }
 
     /// Slim transport overlay shown during perform mode: pause/resume + exit.
+    /// Mixer panel geometry, when visible. One hardware-like unit docked
+    /// above the bottom bar: 4 track strips + a master strip. Strip i is
+    /// a track for i < MIX_TRACKS, the master for i == MIX_TRACKS.
+    fn mixer_geom(&self) -> Option<MixerGeom> {
+        if !self.show_mixer {
+            return None;
+        }
+        let (w, h) = (self.win_w as i32, self.win_h as i32);
+        let pw = (w - 32).min(660);
+        let px = (w - pw) / 2;
+        let py = h - BOT_H - 174 - 8;
+        let panel = SdlRect::new(px, py, pw as u32, 174);
+        let close = SdlRect::new(px + pw - 34, py + 8, 26, 18);
+        let x0 = px + 14;
+        let strip_w = (pw - 28 - 40) / 5;
+        let strips: [MixerStripGeom; 5] = std::array::from_fn(|i| {
+            let sx = x0 + i as i32 * (strip_w + 10);
+            let cx = sx + strip_w / 2;
+            let vol =
+                if i >= MIX_TRACKS { self.doc.data.mixer.master } else { self.doc.data.mixer.vol[i] };
+            let fader = SdlRect::new(cx - 4, py + 52, 8, 72);
+            let cap_y = fader.y() + ((1.0 - vol) * (fader.height() as f32 - 12.0)) as i32;
+            MixerStripGeom {
+                fader,
+                cap: SdlRect::new(cx - 14, cap_y, 28, 12),
+                meter: SdlRect::new(cx + 12, py + 52, 5, 72),
+                mute: SdlRect::new(cx - 27, py + 130, 26, 20),
+                solo: SdlRect::new(cx + 1, py + 130, 26, 20),
+                cx,
+            }
+        });
+        Some(MixerGeom { panel, close, strips })
+    }
+
+    fn draw_mixer(&mut self) -> Result<(), String> {
+        self.mixer_hits.clear();
+        let g = match self.mixer_geom() {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+        // smoothed meters: fast attack, slow decay
+        if let Ok(sh) = self.mixer.lock() {
+            for i in 0..MIX_TRACKS {
+                self.mixer_peaks[i] = sh.peaks[i].max(self.mixer_peaks[i] * 0.75);
+            }
+        }
+        let (px, py) = (g.panel.x(), g.panel.y());
+        self.label_fade = self.ui_fade;
+        // warm off-white hardware unit on the dark chrome (Braun SK-4 /
+        // Teenage Engineering: one quiet object, everything legible)
+        let bg = Color::RGB(0xE9, 0xE4, 0xDA);
+        let ink = Color::RGB(0x20, 0x20, 0x24);
+        let dim = Color::RGB(0x6E, 0x68, 0x5E);
+        let btn_bg = Color::RGB(0xD8, 0xD2, 0xC6);
+        self.canvas.set_draw_color(bg);
+        self.canvas.fill_rect(g.panel)?;
+        self.canvas.set_draw_color(ink);
+        self.canvas.draw_rect(g.panel)?;
+        self.draw_label("MIXER", ink, px + 12, py + 10)?;
+        self.canvas.set_draw_color(btn_bg);
+        self.canvas.fill_rect(g.close)?;
+        self.canvas.set_draw_color(ink);
+        self.canvas.draw_rect(g.close)?;
+        self.draw_label("x", ink, g.close.x() + 8, g.close.y() + 2)?;
+        self.mixer_hits.push((g.close, MixerAction::Close));
+        let mix = self.doc.data.mixer.clone();
+        for i in 0..5 {
+            let s = &g.strips[i];
+            let is_master = i == MIX_TRACKS;
+            let (cr, cg, cb) = if is_master {
+                (ink.r, ink.g, ink.b)
+            } else {
+                let c = TRACK_COLORS[i];
+                (c[0], c[1], c[2])
+            };
+            let title = if is_master { "MASTER".to_string() } else { format!("{}", i + 1) };
+            let (tw, _) = self.font_ui.size_of(&title).unwrap_or((0, 0));
+            self.draw_label(&title, ink, s.cx - tw as i32 / 2, py + 30)?;
+            // fader track
+            self.canvas.set_draw_color(Color::RGB(0xB8, 0xB0, 0xA2));
+            self.canvas.fill_rect(s.fader)?;
+            // meter (tracks only)
+            if !is_master {
+                let mh = (self.mixer_peaks[i] * s.meter.height() as f32) as i32;
+                if mh > 0 {
+                    self.canvas.set_draw_color(Color::RGB(cr, cg, cb));
+                    self.canvas.fill_rect(SdlRect::new(
+                        s.meter.x(),
+                        s.meter.y() + s.meter.height() as i32 - mh,
+                        s.meter.width(),
+                        mh as u32,
+                    ))?;
+                }
+                self.canvas.set_draw_color(dim);
+                self.canvas.draw_rect(s.meter)?;
+            }
+            // cap
+            self.canvas.set_draw_color(Color::RGB(cr, cg, cb));
+            self.canvas.fill_rect(s.cap)?;
+            self.canvas.set_draw_color(ink);
+            self.canvas.draw_rect(s.cap)?;
+            if !is_master {
+                let m_on = mix.mute[i];
+                let s_on = mix.solo[i];
+                self.canvas.set_draw_color(if m_on { ink } else { btn_bg });
+                self.canvas.fill_rect(s.mute)?;
+                self.canvas.set_draw_color(ink);
+                self.canvas.draw_rect(s.mute)?;
+                self.draw_label("M", if m_on { bg } else { ink }, s.mute.x() + 8, s.mute.y() + 3)?;
+                self.canvas.set_draw_color(if s_on {
+                    Color::RGB(0xD9, 0x6C, 0x33)
+                } else {
+                    btn_bg
+                });
+                self.canvas.fill_rect(s.solo)?;
+                self.canvas.set_draw_color(ink);
+                self.canvas.draw_rect(s.solo)?;
+                self.draw_label("S", ink, s.solo.x() + 8, s.solo.y() + 3)?;
+                self.mixer_hits.push((s.mute, MixerAction::Mute(i)));
+                self.mixer_hits.push((s.solo, MixerAction::Solo(i)));
+                let n = self.doc.data.clips.iter().filter(|c| c.track_idx() == i).count();
+                let foot = match n {
+                    0 => "empty".to_string(),
+                    1 => "1 clip".to_string(),
+                    _ => format!("{} clips", n),
+                };
+                let (fw, _) = self.font_ui.size_of(&foot).unwrap_or((0, 0));
+                self.draw_label(&foot, dim, s.cx - fw as i32 / 2, py + 152)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mixer click handling shared by normal + perform modes. Returns true
+    /// when the click landed on the mixer (buttons toggle, fader grabs
+    /// start a drag and jump to the clicked level).
+    fn mixer_click(&mut self, sx: i32, sy: i32) -> bool {
+        let g = match self.mixer_geom() {
+            Some(g) => g,
+            None => return false,
+        };
+        for (r, act) in self.mixer_hits.clone() {
+            if r.contains_point((sx, sy)) {
+                self.mixer_action(act);
+                return true;
+            }
+        }
+        for (i, s) in g.strips.iter().enumerate() {
+            let grab =
+                SdlRect::new(s.fader.x() - 14, s.fader.y() - 4, s.fader.width() + 28, s.fader.height() + 8);
+            if grab.contains_point((sx, sy)) {
+                self.drag = DragKind::MixerFader(i as u8);
+                let v = 1.0 - (sy - s.fader.y()) as f32 / (s.fader.height() as f32 - 12.0);
+                self.set_mixer_vol(i as u8, v);
+                return true;
+            }
+        }
+        false
+    }
+
     fn draw_perform_bar(&mut self) -> Result<(), String> {
         self.perform_hits.clear();
         if !self.perform.is_active() {
@@ -3637,6 +4051,12 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
         let data = Doc::from_json(&s).map_err(|e| format!("open failed: {e}"))?;
         let n_img = data.images.len();
         self.doc.load_data(data);
+        // the mixer device reads the shared live state: sync it from the
+        // loaded file (faders would otherwise show file values while the
+        // callback still used the previous doc's gains)
+        if let Ok(mut sh) = self.mixer.lock() {
+            sh.state = self.doc.data.mixer.clone();
+        }
         // restore the saved tool-property overrides (clamped, like :set)
         {
             let d = &self.doc.data;
@@ -3951,6 +4371,7 @@ impl<'tc, 'ttf> App<'tc, 'ttf> {
             y: -50.0,
             seconds: 1.0,
             data: audio::b64encode(&ulaw),
+            track: 1,
         });
         let nc0 = self.doc.data.clips.len();
         self.doc.undo();

@@ -1,7 +1,7 @@
 //! Document: strokes/images/texts/clips + undo/redo + save/load.
 //! Pure data (no SDL) except via canvas types.
 
-use crate::audio::AudioClip;
+use crate::audio::{AudioClip, MixerState, MIX_TRACKS};
 use crate::brush::Tool;
 use crate::canvas::{ImageMeta, Rect, Stroke, TextMeta, VectorMeta};
 use crate::palette::COLOR_SETS;
@@ -34,6 +34,10 @@ pub struct DocData {
     pub vectors: Vec<VectorMeta>,
     #[serde(default)]
     pub clips: Vec<AudioClip>,
+    /// Four-track mixer state (faders, mutes, solos, master).
+    /// Legacy files without it load factory defaults.
+    #[serde(default)]
+    pub mixer: MixerState,
     #[serde(default = "default_bg")]
     pub bg: [u8; 3],
     #[serde(default = "default_palette")]
@@ -268,6 +272,19 @@ impl Doc {
             c.x += dx as f64;
             c.y += dy as f64;
             self.push_undo(Action::MoveClip { id, dx, dy });
+        }
+    }
+    /// Route a clip to a mixer track (1..=4, clamped). A property edit
+    /// like tool sizes: persists in the file, marks the doc dirty via
+    /// touch(), no undo entry.
+    pub fn set_clip_track(&mut self, id: u64, track: u8) -> bool {
+        match self.data.clips.iter_mut().find(|c| c.id == id) {
+            Some(c) => {
+                c.track = track.clamp(1, MIX_TRACKS as u8);
+                self.touch();
+                true
+            }
+            None => false,
         }
     }
 
@@ -578,7 +595,7 @@ mod tests {
 
     fn clip(id: u64) -> AudioClip {
         let ulaw: Vec<u8> = (0..1200).map(|i| mulaw_encode(i as i16 - 600)).collect();
-        AudioClip { id, x: 10.0, y: 20.0, seconds: 0.1, data: b64encode(&ulaw) }
+        AudioClip { id, x: 10.0, y: 20.0, seconds: 0.1, data: b64encode(&ulaw), track: 1 }
     }
     #[test]
     fn clip_undo_redo() {
@@ -760,6 +777,33 @@ mod tests {
         let s0 = d.seq();
         d.touch();
         assert_eq!(d.seq(), s0 + 1);
+    }
+    #[test]
+    fn clip_track_routing_persists_and_legacy_mixer_defaults() {
+        let mut d = Doc::new();
+        d.add_clip(AudioClip {
+            id: 5,
+            x: 0.0,
+            y: 0.0,
+            seconds: 1.0,
+            data: String::new(),
+            track: 1,
+        });
+        assert!(d.set_clip_track(5, 3));
+        assert!(!d.set_clip_track(999, 2)); // unknown clip: no-op
+        assert_eq!(d.data.clips[0].track, 3);
+        let j = d.to_json().unwrap();
+        let data = Doc::from_json(&j).unwrap();
+        assert_eq!(data.clips[0].track, 3);
+        assert_eq!(data.mixer.vol, [0.8; 4]);
+        d.set_clip_track(5, 9); // clamps to track 4
+        assert_eq!(d.data.clips[0].track, 4);
+        // legacy file without mixer/track fields loads factory defaults
+        let legacy = r#"{"strokes":[],"images":[],"texts":[]}"#;
+        let data = Doc::from_json(legacy).unwrap();
+        assert_eq!(data.mixer.vol, [0.8; 4]);
+        assert_eq!(data.mixer.master, 1.0);
+        assert!(data.mixer.mute.iter().all(|m| !m));
     }
     #[test]
     fn oil_blur_needs_no_tracking_state() {
